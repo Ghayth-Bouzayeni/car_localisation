@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🚗 Carte des véhicules BLE</title>
+    
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        
+        h1 {
+            color: #333;
+            margin-bottom: 20px;
+        }
+        
+        #map {
+            height: 500px;
+            width: 100%;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        
+        .vehicles-list {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        
+        .vehicle-card {
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 10px;
+            margin: 5px 0;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 10px;
+            background: #fafafa;
+        }
+        
+        .vehicle-card:hover {
+            background: #f0f0f0;
+        }
+        
+        .label {
+            font-weight: bold;
+            color: #555;
+        }
+        
+        .no-position {
+            color: #999;
+            font-style: italic;
+        }
+        
+        .stats {
+            background: #e3f2fd;
+            padding: 10px;
+            border-radius: 4px;
+            margin-bottom: 15px;
+        }
+        
+        button {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-bottom: 15px;
+            font-size: 16px;
+        }
+        
+        button:hover {
+            background: #45a049;
+        }
+        
+        .refresh-btn {
+            background: #2196F3;
+            margin-left: 10px;
+        }
+    </style>
+</head>
+<body>
+    <h1>📍 Carte des véhicules BLE</h1>
+    
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+        <div class="stats" id="stats">
+            Chargement des données...
+        </div>
+        <div>
+            <button onclick="loadData()">🔄 Rafraîchir</button>
+            <button class="refresh-btn" onclick="startAutoRefresh()">⏱️ Auto-refresh (10s)</button>
+            <button class="refresh-btn" onclick="stopAutoRefresh()">⏹️ Arrêter</button>
+        </div>
+    </div>
+    
+    <!-- Carte -->
+    <div id="map"></div>
+    
+    <!-- Liste des véhicules -->
+    <div class="vehicles-list">
+        <h2>📋 Liste des véhicules</h2>
+        <div id="vehicles-container">
+            Chargement...
+        </div>
+    </div>
+
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    
+    <script>
+        // Configuration
+        const BASE_URL = "https://f239-102-152-216-192.ngrok-free.app";
+        const HEADERS = {
+            'ngrok-skip-browser-warning': 'true'
+        };
+        
+        // Variables globales
+        let map = null;
+        let markers = [];
+        let refreshInterval = null;
+        
+        // Initialisation de la carte
+        function initMap() {
+            if (!map) {
+                // Centre par défaut sur la Tunisie
+                map = L.map('map').setView([34.0, 9.0], 7);
+                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                    attribution: '© OpenStreetMap contributors'
+                }).addTo(map);
+            }
+            return map;
+        }
+        
+        // Nettoyer les marqueurs existants
+        function clearMarkers() {
+            markers.forEach(marker => map.removeLayer(marker));
+            markers = [];
+        }
+        
+        // Charger toutes les données
+        async function loadData() {
+            try {
+                document.getElementById('stats').innerHTML = '🔄 Chargement...';
+                
+                // 1. Récupérer tous les véhicules
+                const vehiclesResponse = await fetch(`${BASE_URL}/cars`, { headers: HEADERS });
+                if (!vehiclesResponse.ok) throw new Error('Erreur chargement véhicules');
+                const vehicles = await vehiclesResponse.json();
+                
+                // 2. Récupérer toutes les dernières positions
+                const positionsResponse = await fetch(`${BASE_URL}/positions/latest`, { headers: HEADERS });
+                let positions = [];
+                if (positionsResponse.ok) {
+                    positions = await positionsResponse.json();
+                }
+                
+                // Créer un dictionnaire des positions par device_id
+                const positionsByDevice = {};
+                positions.forEach(pos => {
+                    positionsByDevice[pos.device_id] = pos;
+                });
+                
+                // 3. Récupérer les associations pour lier véhicules et devices
+                // Note: On va chercher les associations via les véhicules
+                const vehiclesWithDetails = [];
+                
+                for (const vehicle of vehicles) {
+                    // Chercher l'association pour ce véhicule
+                    let deviceId = null;
+                    let position = null;
+                    
+                    try {
+                        // Essayer de récupérer le device associé
+                        const assocResponse = await fetch(`${BASE_URL}/vehicles/${vehicle.id}/device`, { headers: HEADERS });
+                        if (assocResponse.ok) {
+                            const assoc = await assocResponse.json();
+                            deviceId = assoc.device_id;
+                            
+                            // Chercher la position de ce device
+                            const devicePosition = positions.find(p => {
+                                // Chercher le device ID dans les positions
+                                // Note: C'est simplifié, à adapter selon votre structure
+                                return true;
+                            });
+                            
+                            if (devicePosition) {
+                                position = devicePosition;
+                            }
+                        }
+                    } catch (e) {
+                        // Pas d'association
+                    }
+                    
+                    vehiclesWithDetails.push({
+                        ...vehicle,
+                        deviceId: deviceId,
+                        position: position
+                    });
+                }
+                
+                // Afficher sur la carte
+                displayOnMap(vehiclesWithDetails);
+                
+                // Afficher la liste
+                displayVehiclesList(vehiclesWithDetails);
+                
+                // Mettre à jour les stats
+                const withPosition = vehiclesWithDetails.filter(v => v.position).length;
+                document.getElementById('stats').innerHTML = `
+                    <strong>📊 Statistiques:</strong> 
+                    ${vehicles.length} véhicules au total | 
+                    ${withPosition} avec position GPS |
+                    ${vehicles.length - withPosition} sans position
+                `;
+                
+            } catch (error) {
+                console.error('Erreur:', error);
+                document.getElementById('stats').innerHTML = `❌ Erreur: ${error.message}`;
+            }
+        }
+        
+        // Afficher les véhicules sur la carte
+        function displayOnMap(vehicles) {
+            clearMarkers();
+            initMap();
+            
+            const bounds = [];
+            
+            vehicles.forEach(vehicle => {
+                if (vehicle.position) {
+                    const pos = vehicle.position;
+                    const lat = parseFloat(pos.latitude);
+                    const lng = parseFloat(pos.longitude);
+                    
+                    if (!isNaN(lat) && !isNaN(lng)) {
+                        bounds.push([lat, lng]);
+                        
+                        // Choisir la couleur selon le statut
+                        let color = 'blue';
+                        if (vehicle.status === 'maintenance') color = 'red';
+                        if (vehicle.status === 'in_transit') color = 'green';
+                        if (vehicle.status === 'delivered') color = 'gray';
+                        
+                        // Créer un marqueur personnalisé
+                        const marker = L.marker([lat, lng], {
+                            icon: L.divIcon({
+                                className: 'custom-marker',
+                                html: `<div style="background-color: ${color}; width: 20px; height: 20px; border-radius: 50%; border: 2px solid white; box-shadow: 0 2px 5px rgba(0,0,0,0.3);"></div>`,
+                                iconSize: [20, 20]
+                            })
+                        }).addTo(map);
+                        
+                        // Popup avec les infos du véhicule
+                        marker.bindPopup(`
+                            <b>🚗 Véhicule #${vehicle.id}</b><br>
+                            <b>VIN:</b> ${vehicle.vin}<br>
+                            <b>Modèle:</b> ${vehicle.model}<br>
+                            <b>Couleur:</b> ${vehicle.color}<br>
+                            <b>Zone:</b> ${vehicle.zone}<br>
+                            <b>Statut:</b> ${vehicle.status}<br>
+                            <b>Position:</b> ${lat.toFixed(6)}, ${lng.toFixed(6)}<br>
+                            <b>Mouvement:</b> ${pos.movement_status || 'N/A'}<br>
+                            <b>Dernière mise à jour:</b> ${new Date(pos.received_at).toLocaleString()}<br>
+                            <a href="https://www.google.com/maps?q=${lat},${lng}" target="_blank">Voir sur Google Maps</a>
+                        `);
+                        
+                        markers.push(marker);
+                    }
+                }
+            });
+            
+            // Ajuster la vue pour voir tous les marqueurs
+            if (bounds.length > 0) {
+                map.fitBounds(bounds);
+            }
+        }
+        
+        // Afficher la liste des véhicules
+        function displayVehiclesList(vehicles) {
+            const container = document.getElementById('vehicles-container');
+            
+            if (vehicles.length === 0) {
+                container.innerHTML = '<p>Aucun véhicule trouvé</p>';
+                return;
+            }
+            
+            let html = '';
+            vehicles.forEach(vehicle => {
+                const pos = vehicle.position;
+                const hasPosition = pos ? '📍' : '❌';
+                const positionText = pos 
+                    ? `${parseFloat(pos.latitude).toFixed(6)}, ${parseFloat(pos.longitude).toFixed(6)}` 
+                    : 'Pas de position';
+                const lastUpdate = pos ? new Date(pos.received_at).toLocaleString() : '-';
+                const movement = pos ? pos.movement_status : '-';
+                
+                html += `
+                    <div class="vehicle-card">
+                        <div><span class="label">ID:</span> ${vehicle.id} ${hasPosition}</div>
+                        <div><span class="label">VIN:</span> ${vehicle.vin}</div>
+                        <div><span class="label">Modèle:</span> ${vehicle.model}</div>
+                        <div><span class="label">Couleur:</span> ${vehicle.color}</div>
+                        <div><span class="label">Zone:</span> ${vehicle.zone}</div>
+                        <div><span class="label">Statut:</span> ${vehicle.status}</div>
+                        <div><span class="label">Position:</span> ${positionText}</div>
+                        <div><span class="label">Mouvement:</span> ${movement}</div>
+                        <div><span class="label">Dernière MAJ:</span> ${lastUpdate}</div>
+                    </div>
+                `;
+            });
+            
+            container.innerHTML = html;
+        }
+        
+        // Auto-refresh
+        function startAutoRefresh() {
+            if (refreshInterval) clearInterval(refreshInterval);
+            refreshInterval = setInterval(loadData, 10000);
+            showNotification('⏱️ Auto-refresh activé (10s)');
+        }
+        
+        function stopAutoRefresh() {
+            if (refreshInterval) {
+                clearInterval(refreshInterval);
+                refreshInterval = null;
+                showNotification('⏹️ Auto-refresh arrêté');
+            }
+        }
+        
+        function showNotification(msg) {
+            const stats = document.getElementById('stats');
+            const original = stats.innerHTML;
+            stats.innerHTML = `📢 ${msg}`;
+            setTimeout(() => {
+                stats.innerHTML = original;
+            }, 2000);
+        }
+        
+        // Initialisation
+        document.addEventListener('DOMContentLoaded', () => {
+            initMap();
+            loadData();
+        });
+    </script>
+</body>
+</html>

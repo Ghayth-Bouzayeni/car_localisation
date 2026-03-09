@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Associer Tag à la voiture</title>
+</head>
+<body>
+  <h1>Associer le tag à votre voiture</h1>
+
+  <p id="deviceId">Device ID: ...</p>
+
+  <form id="carForm">
+    <input type="hidden" id="hiddenDeviceId" name="device_id" value="">
+    <label>Plaque : <input type="text" name="plate" required></label><br>
+    <label>Marque : <input type="text" name="make" required></label><br>
+    <label>Modèle : <input type="text" name="model" required></label><br>
+    <button type="submit">Enregistrer</button>
+  </form>
+
+  <p id="status"></p>
+
+  <script>
+    // Récupère le device_id depuis l'URL
+    const params = new URLSearchParams(window.location.search);
+    const deviceId = params.get('device_id');
+    document.getElementById('deviceId').innerText = "Device ID: " + deviceId;
+    document.getElementById('hiddenDeviceId').value = deviceId;
+
+    // Soumission du formulaire via fetch vers le backend
+    document.getElementById('carForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const formData = new FormData(e.target);
+      const data = Object.fromEntries(formData.entries());
+
+      const res = await fetch('/register-car', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(data)
+      });
+
+      if(res.ok){
+        document.getElementById('status').innerText = "Voiture enregistrée avec succès ! Vous pouvez fermer cette page.";
+      } else {
+        document.getElementById('status').innerText = "Erreur lors de l'enregistrement";
+      }
+    });
+  </script>
+</body>
+</html>

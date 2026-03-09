@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Test BLE Association - Véhicule & Device</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        h1 {
+            color: #333;
+            border-bottom: 3px solid #4CAF50;
+            padding-bottom: 10px;
+        }
+        h2 {
+            color: #555;
+            margin-top: 25px;
+        }
+        .container {
+            background-color: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+            color: #444;
+        }
+        input, textarea {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+            box-sizing: border-box;
+        }
+        input:focus {
+            outline: none;
+            border-color: #4CAF50;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            margin-right: 10px;
+            transition: background-color 0.3s;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        button.secondary {
+            background-color: #2196F3;
+        }
+        button.secondary:hover {
+            background-color: #1976D2;
+        }
+        button.danger {
+            background-color: #f44336;
+        }
+        button.danger:hover {
+            background-color: #da190b;
+        }
+        .result {
+            background-color: #1e1e1e;
+            color: #00ff00;
+            padding: 15px;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            max-height: 300px;
+            overflow-y: auto;
+            margin-top: 15px;
+        }
+        .info-box {
+            background-color: #e3f2fd;
+            border-left: 4px solid #2196F3;
+            padding: 10px 15px;
+            margin: 15px 0;
+            border-radius: 4px;
+        }
+        .success {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        .error {
+            background-color: #f44336;
+            color: white;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        .device-id {
+            font-family: 'Courier New', monospace;
+            background-color: #f0f0f0;
+            padding: 8px;
+            border-radius: 4px;
+            border: 1px solid #ddd;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <h1>🔧 Test d'association BLE - Véhicule ↔ Device</h1>
+    
+    <div class="container">
+        <div class="info-box">
+            <strong>📡 API via ngrok:</strong> 
+            <code id="apiUrl">https://f239-102-152-216-192.ngrok-free.app</code>
+            <br>
+            <small>⚠️ L'en-tête <code>ngrok-skip-browser-warning: true</code> est automatiquement ajouté</small>
+        </div>
+
+        <!-- ÉTAPE 1: Scanner le device -->
+        <h2>📱 ÉTAPE 1: Scanner le device BLE</h2>
+        <div class="form-group">
+            <label for="deviceId">Device Identifier scanné:</label>
+            <input type="text" id="deviceId" value="urn:uuid:17e56c9a-adef-42f1-9679-4fa0d0c9301d" placeholder="ID du device scanné">
+            <button onclick="simulateScan()" class="secondary" style="margin-top: 10px;">🔍 Simuler un scan</button>
+        </div>
+        <div id="scanResult" class="device-id"></div>
+    </div>
+
+    <!-- ÉTAPE 2: Créer le véhicule -->
+    <div class="container">
+        <h2>🚗 ÉTAPE 2: Créer le véhicule</h2>
+        <div class="form-group">
+            <label for="vin">VIN:</label>
+            <input type="text" id="vin" value="1HGCM82633A004352" placeholder="Numéro VIN">
+        </div>
+        <div class="form-group">
+            <label for="model">Modèle:</label>
+            <input type="text" id="model" value="Honda Civic" placeholder="Modèle">
+        </div>
+        <div class="form-group">
+            <label for="color">Couleur:</label>
+            <input type="text" id="color" value="Red" placeholder="Couleur">
+        </div>
+        <div class="form-group">
+            <label for="zone">Zone:</label>
+            <input type="text" id="zone" value="Zone A" placeholder="Zone">
+        </div>
+        <div class="form-group">
+            <label for="entry_date">Date d'entrée:</label>
+            <input type="date" id="entry_date" value="2026-03-01">
+        </div>
+        <div class="form-group">
+            <label for="customer">Client:</label>
+            <input type="text" id="customer" value="John Doe" placeholder="Nom du client">
+        </div>
+        <div class="form-group">
+            <label for="country">Pays de livraison:</label>
+            <input type="text" id="country" value="Tunisia" placeholder="Pays">
+        </div>
+        <button onclick="createVehicle()">🚀 Créer le véhicule</button>
+        <div id="vehicleResult" class="result">Cliquez sur "Créer le véhicule" pour commencer...</div>
+    </div>
+
+    <!-- ÉTAPE 3: Associer le device -->
+    <div class="container">
+        <h2>🔗 ÉTAPE 3: Associer le véhicule au device</h2>
+        <div class="form-group">
+            <label for="vehicleIdForAssoc">ID du véhicule (automatique après création):</label>
+            <input type="text" id="vehicleIdForAssoc" readonly placeholder="ID du véhicule créé">
+        </div>
+        <div class="form-group">
+            <label for="deviceIdForAssoc">Device Identifier:</label>
+            <input type="text" id="deviceIdForAssoc" readonly placeholder="Device scanné">
+        </div>
+        <button onclick="associateDevice()" class="secondary" id="assocBtn">🔗 Associer le device</button>
+        <div id="assocResult" class="result">Créez d'abord un véhicule...</div>
+    </div>
+
+    <!-- ÉTAPE 4: Vérification finale -->
+    <div class="container">
+        <h2>✅ ÉTAPE 4: Vérification</h2>
+        <button onclick="checkAssociation()">🔍 Vérifier l'association</button>
+        <button onclick="getAllVehicles()">📋 Voir tous les véhicules</button>
+        <button onclick="resetForm()" class="danger">🔄 Réinitialiser</button>
+        <div id="checkResult" class="result"></div>
+    </div>
+
+    <script>
+        const BASE_URL = "https://f239-102-152-216-192.ngrok-free.app";
+        const HEADERS = {
+            'Content-Type': 'application/json',
+            'ngrok-skip-browser-warning': 'true'
+        };
+
+        let currentVehicleId = null;
+
+        // Mettre à jour l'affichage des IDs
+        function updateIds() {
+            document.getElementById('vehicleIdForAssoc').value = currentVehicleId || '';
+            document.getElementById('deviceIdForAssoc').value = document.getElementById('deviceId').value;
+        }
+
+        // Simuler un scan de device
+        function simulateScan() {
+            const devices = [
+                "urn:uuid:17e56c9a-adef-42f1-9679-4fa0d0c9301d",
+                "urn:uuid:12345678-1234-1234-1234-123456789012",
+                "urn:uuid:87654321-4321-4321-4321-210987654321"
+            ];
+            const randomDevice = devices[Math.floor(Math.random() * devices.length)];
+            document.getElementById('deviceId').value = randomDevice;
+            document.getElementById('scanResult').innerHTML = `✅ Device scanné: <strong>${randomDevice}</strong>`;
+            updateIds();
+        }
+
+        // ÉTAPE 2: Créer le véhicule
+        async function createVehicle() {
+            const vehicleData = {
+                vin: document.getElementById('vin').value,
+                model: document.getElementById('model').value,
+                color: document.getElementById('color').value,
+                zone: document.getElementById('zone').value,
+                entry_date: document.getElementById('entry_date').value,
+                customer: document.getElementById('customer').value,
+                delivery_country: document.getElementById('country').value
+            };
+
+            const resultDiv = document.getElementById('vehicleResult');
+            resultDiv.textContent = '🚀 Création en cours...';
+
+            try {
+                const response = await fetch(`${BASE_URL}/cars`, {
+                    method: 'POST',
+                    headers: HEADERS,
+                    body: JSON.stringify(vehicleData)
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+                }
+
+                const vehicle = await response.json();
+                currentVehicleId = vehicle.id;
+                updateIds();
+                
+                resultDiv.textContent = JSON.stringify(vehicle, null, 2);
+                showMessage('✅ Véhicule créé avec succès!', 'success');
+                
+                // Activer le bouton d'association
+                document.getElementById('assocBtn').disabled = false;
+                
+            } catch (error) {
+                resultDiv.textContent = `❌ Erreur: ${error.message}`;
+                showMessage('Erreur lors de la création', 'error');
+            }
+        }
+
+        // ÉTAPE 3: Associer le device
+        async function associateDevice() {
+            if (!currentVehicleId) {
+                alert('Veuillez d\'abord créer un véhicule!');
+                return;
+            }
+
+            const deviceId = document.getElementById('deviceId').value;
+            if (!deviceId) {
+                alert('Veuillez scanner un device!');
+                return;
+            }
+
+            const resultDiv = document.getElementById('assocResult');
+            resultDiv.textContent = '🔗 Association en cours...';
+
+            try {
+                const response = await fetch(
+                    `${BASE_URL}/associate?vehicle_id=${currentVehicleId}&device_identifier=${deviceId}`,
+                    {
+                        method: 'POST',
+                        headers: {
+                            'ngrok-skip-browser-warning': 'true'
+                        }
+                    }
+                );
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+                }
+
+                const result = await response.json();
+                resultDiv.textContent = JSON.stringify(result, null, 2);
+                showMessage('✅ Association réussie!', 'success');
+                
+            } catch (error) {
+                resultDiv.textContent = `❌ Erreur: ${error.message}`;
+                showMessage('Erreur lors de l\'association', 'error');
+            }
+        }
+
+        // Vérifier l'association
+        async function checkAssociation() {
+            if (!currentVehicleId) {
+                alert('Veuillez d\'abord créer un véhicule!');
+                return;
+            }
+
+            const resultDiv = document.getElementById('checkResult');
+            resultDiv.textContent = '🔍 Vérification...';
+
+            try {
+                // Récupérer le véhicule
+                const response = await fetch(`${BASE_URL}/cars/${currentVehicleId}`, {
+                    headers: {
+                        'ngrok-skip-browser-warning': 'true'
+                    }
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+
+                const vehicle = await response.json();
+                
+                // Essayer de voir l'association (si endpoint existe)
+                let assocInfo = { vehicle };
+                try {
+                    const assocResponse = await fetch(`${BASE_URL}/vehicles/${currentVehicleId}/device`, {
+                        headers: {
+                            'ngrok-skip-browser-warning': 'true'
+                        }
+                    });
+                    if (assocResponse.ok) {
+                        assocInfo.association = await assocResponse.json();
+                    }
+                } catch (e) {
+                    assocInfo.association = "Endpoint non disponible";
+                }
+
+                resultDiv.textContent = JSON.stringify(assocInfo, null, 2);
+                
+            } catch (error) {
+                resultDiv.textContent = `❌ Erreur: ${error.message}`;
+            }
+        }
+
+        // Voir tous les véhicules
+        async function getAllVehicles() {
+            const resultDiv = document.getElementById('checkResult');
+            resultDiv.textContent = '📋 Récupération...';
+
+            try {
+                const response = await fetch(`${BASE_URL}/cars`, {
+                    headers: {
+                        'ngrok-skip-browser-warning': 'true'
+                    }
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+
+                const vehicles = await response.json();
+                resultDiv.textContent = JSON.stringify(vehicles, null, 2);
+                
+            } catch (error) {
+                resultDiv.textContent = `❌ Erreur: ${error.message}`;
+            }
+        }
+
+        // Afficher un message temporaire
+        function showMessage(msg, type) {
+            const msgDiv = document.createElement('div');
+            msgDiv.className = type;
+            msgDiv.textContent = msg;
+            document.body.insertBefore(msgDiv, document.body.firstChild);
+            setTimeout(() => msgDiv.remove(), 3000);
+        }
+
+        // Réinitialiser le formulaire
+        function resetForm() {
+            currentVehicleId = null;
+            document.getElementById('vehicleIdForAssoc').value = '';
+            document.getElementById('vehicleResult').textContent = 'Cliquez sur "Créer le véhicule" pour commencer...';
+            document.getElementById('assocResult').textContent = 'Créez d\'abord un véhicule...';
+            document.getElementById('checkResult').textContent = '';
+            document.getElementById('scanResult').innerHTML = '';
+            document.getElementById('vin').value = '1HGCM82633A004352';
+            document.getElementById('model').value = 'Honda Civic';
+            document.getElementById('color').value = 'Red';
+            document.getElementById('zone').value = 'Zone A';
+            document.getElementById('entry_date').value = '2026-03-01';
+            document.getElementById('customer').value = 'John Doe';
+            document.getElementById('country').value = 'Tunisia';
+        }
+
+        // Initialisation
+        updateIds();
+    </script>
+</body>
+</html>

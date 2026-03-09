@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: blekon-api
+    runtime: docker
+    plan: free
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: DEBUG
+        value: "false"
