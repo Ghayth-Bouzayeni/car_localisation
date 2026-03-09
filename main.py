@@ -97,6 +97,43 @@ def create_car(car: VehicleCreate, db: Session = Depends(get_db)):
 def get_cars(db: Session = Depends(get_db)):
     return db.query(Vehicle).all()
 
+# -------------------
+# Voitures associées avec positions (pour la carte)
+# -------------------
+@app.get("/cars/with-positions", response_model=list[VehicleFrontOut])
+def get_cars_with_positions(db: Session = Depends(get_db)):
+    # Get all active associations with their vehicle and device
+    associations = db.query(VehicleDeviceAssociation).filter(
+        VehicleDeviceAssociation.active == True
+    ).all()
+
+    results = []
+    for assoc in associations:
+        vehicle = db.query(Vehicle).filter(Vehicle.id == assoc.vehicle_id).first()
+        device = db.query(Device).filter(Device.id == assoc.device_id).first()
+        if not vehicle or not device:
+            continue
+
+        # Get latest position for this device
+        location = db.query(Location).filter(
+            Location.device_id == device.id
+        ).order_by(desc(Location.received_at)).first()
+
+        results.append(VehicleFrontOut(
+            id=vehicle.id,
+            vin=vehicle.vin,
+            model=vehicle.model,
+            color=vehicle.color,
+            zone=vehicle.zone,
+            status=vehicle.status,
+            device_identifier=device.device_identifier,
+            last_latitude=float(location.latitude) if location else None,
+            last_longitude=float(location.longitude) if location else None,
+            last_position_time=location.received_at if location else None,
+        ))
+
+    return results
+
 @app.get("/cars/{car_id}", response_model=VehicleOut)
 def get_car(car_id: int, db: Session = Depends(get_db)):
     car = db.query(Vehicle).filter(Vehicle.id == car_id).first()
@@ -195,43 +232,6 @@ def get_vehicle_device(vehicle_id: int, db: Session = Depends(get_db)):
         "device_id": device.device_identifier if device else None,
         "association_date": association.association_date
     }
-
-# -------------------
-# Voitures associées avec positions (pour la carte)
-# -------------------
-@app.get("/cars/with-positions", response_model=list[VehicleFrontOut])
-def get_cars_with_positions(db: Session = Depends(get_db)):
-    # Get all active associations with their vehicle and device
-    associations = db.query(VehicleDeviceAssociation).filter(
-        VehicleDeviceAssociation.active == True
-    ).all()
-
-    results = []
-    for assoc in associations:
-        vehicle = db.query(Vehicle).filter(Vehicle.id == assoc.vehicle_id).first()
-        device = db.query(Device).filter(Device.id == assoc.device_id).first()
-        if not vehicle or not device:
-            continue
-
-        # Get latest position for this device
-        location = db.query(Location).filter(
-            Location.device_id == device.id
-        ).order_by(desc(Location.received_at)).first()
-
-        results.append(VehicleFrontOut(
-            id=vehicle.id,
-            vin=vehicle.vin,
-            model=vehicle.model,
-            color=vehicle.color,
-            zone=vehicle.zone,
-            status=vehicle.status,
-            device_identifier=device.device_identifier,
-            last_latitude=float(location.latitude) if location else None,
-            last_longitude=float(location.longitude) if location else None,
-            last_position_time=location.received_at if location else None,
-        ))
-
-    return results
 
 # -------------------
 # Positions des voitures
