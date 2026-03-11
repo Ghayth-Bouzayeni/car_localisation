@@ -3,6 +3,8 @@ services:
     name: blekon-api
     runtime: docker
     plan: free
+    autoDeploy: true
+    branch: master
     envVars:
       - key: DATABASE_URL
         sync: false
