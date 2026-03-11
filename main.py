@@ -44,7 +44,7 @@ async def blekon_webhook(request: Request):
 
     for event in data:
         if event["type"] == "network.device_position":
-            device_identifier = event["data"]["device_id"]
+            device_identifier = event["data"]["device_id"].lower()  # normalize case
             coords = event["data"]["geojson"]["geometry"]["coordinates"]  # [lon, lat]
             accuracy = event["data"]["quality"]["accuracy_meters"]
             movement_status = event["data"].get("movement_status", "static")
@@ -170,6 +170,8 @@ def delete_car(car_id: int, db: Session = Depends(get_db)):
 # -------------------
 @app.post("/associate")
 def associate_vehicle_device(vehicle_id: int, device_identifier: str, db: Session = Depends(get_db)):
+    device_identifier = device_identifier.lower()  # normalize case
+
     # 1️⃣ Vérifier si la voiture existe
     vehicle = db.query(Vehicle).filter(Vehicle.id == vehicle_id).first()
     if not vehicle:
