@@ -42,44 +42,94 @@ async def blekon_webhook(request: Request):
     data = await request.json()
     db: Session = next(get_db())
 
-    for event in data:
-        if event["type"] == "network.device_position":
-            device_identifier = event["data"]["device_id"].lower()  # normalize case
-            coords = event["data"]["geojson"]["geometry"]["coordinates"]  # [lon, lat]
-            accuracy = event["data"]["quality"]["accuracy_meters"]
-            movement_status = event["data"].get("movement_status", "static")
-            
-            # 1️⃣ Chercher le device dans la table devices
-            device = db.query(Device).filter(Device.device_identifier == device_identifier).first()
-            if not device:
-                continue  # Device inconnu, on ignore
-                
-            # 2️⃣ Chercher l'association active pour ce device
-            association = db.query(VehicleDeviceAssociation).filter(
-                VehicleDeviceAssociation.device_id == device.id,
-                VehicleDeviceAssociation.active == True
-            ).first()
-            
-            if not association:
-                continue  # Device non associé à un véhicule
-            
-            # 3️⃣ Récupérer le véhicule associé
-            vehicle = db.query(Vehicle).filter(Vehicle.id == association.vehicle_id).first()
-            if not vehicle:
-                continue
+    # Support both BLEcon native events (type=network.device_position) and vendor tag batches
+    # New vendor payload example is a list of objects with fields like tag_id, vendor, last_lat/last_lon
+    # We keep the same logic: only store if device exists and is actively associated to a vehicle.
+    if isinstance(data, list):
+        # Case 1: legacy BLEcon events with "type"
+        if data and isinstance(data[0], dict) and "type" in data[0]:
+            for event in data:
+                if event.get("type") == "network.device_position":
+                    device_identifier = str(event["data"]["device_id"]).lower()
+                    coords = event["data"]["geojson"]["geometry"]["coordinates"]  # [lon, lat]
+                    accuracy = event["data"]["quality"].get("accuracy_meters")
+                    movement_status = event["data"].get("movement_status", "static")
 
-            # 4️⃣ Créer la position
-            location = Location(
-                device_id=device.id,
-                latitude=coords[1],
-                longitude=coords[0],
-                accuracy=accuracy,
-                movement_status=movement_status,
-                received_at=datetime.utcnow()
-            )
-            db.add(location)
-            db.commit()
-    
+                    device = db.query(Device).filter(Device.device_identifier == device_identifier).first()
+                    if not device:
+                        continue
+
+                    association = db.query(VehicleDeviceAssociation).filter(
+                        VehicleDeviceAssociation.device_id == device.id,
+                        VehicleDeviceAssociation.active == True
+                    ).first()
+                    if not association:
+                        continue
+
+                    vehicle = db.query(Vehicle).filter(Vehicle.id == association.vehicle_id).first()
+                    if not vehicle:
+                        continue
+
+                    location = Location(
+                        device_id=device.id,
+                        latitude=coords[1],
+                        longitude=coords[0],
+                        accuracy=accuracy,
+                        movement_status=movement_status,
+                        received_at=datetime.utcnow()
+                    )
+                    db.add(location)
+                    db.commit()
+
+        # Case 2: vendor tag batch (fields: tag_id, vendor, last_lat, last_lon, is_moving, updated_at)
+        elif data and isinstance(data[0], dict) and "tag_id" in data[0]:
+            for tag in data:
+                device_identifier = str(tag.get("tag_id", "")).lower()
+                if not device_identifier:
+                    continue
+
+                lat = tag.get("last_lat")
+                lon = tag.get("last_lon")
+                if lat is None or lon is None:
+                    continue
+
+                movement_status = "moving" if tag.get("is_moving") else "static"
+
+                # Choose received_at: prefer updated_at, then last_seen, else now
+                ts = tag.get("updated_at") or tag.get("last_seen")
+                received_at = datetime.utcnow()
+                if isinstance(ts, str):
+                    try:
+                        received_at = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    except Exception:
+                        received_at = datetime.utcnow()
+
+                device = db.query(Device).filter(Device.device_identifier == device_identifier).first()
+                if not device:
+                    continue
+
+                association = db.query(VehicleDeviceAssociation).filter(
+                    VehicleDeviceAssociation.device_id == device.id,
+                    VehicleDeviceAssociation.active == True
+                ).first()
+                if not association:
+                    continue
+
+                vehicle = db.query(Vehicle).filter(Vehicle.id == association.vehicle_id).first()
+                if not vehicle:
+                    continue
+
+                location = Location(
+                    device_id=device.id,
+                    latitude=lat,
+                    longitude=lon,
+                    accuracy=None,  # no accuracy provided in vendor payload
+                    movement_status=movement_status,
+                    received_at=received_at
+                )
+                db.add(location)
+                db.commit()
+
     return {"status": "ok"}
 
 # -------------------
