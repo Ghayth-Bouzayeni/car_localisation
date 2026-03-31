@@ -84,9 +84,15 @@ async def blekon_webhook(request: Request):
         # Case 2: vendor tag batch (fields: tag_id, vendor, last_lat, last_lon, is_moving, updated_at)
         elif data and isinstance(data[0], dict) and "tag_id" in data[0]:
             for tag in data:
-                device_identifier = str(tag.get("tag_id", "")).lower()
-                if not device_identifier:
+                raw_id = str(tag.get("tag_id", "")).lower()
+                if not raw_id:
                     continue
+
+                # Accept both dashed and non-dashed forms (BLEcon may drop dashes)
+                candidates = {raw_id}
+                if len(raw_id) == 32:
+                    dashed = f"{raw_id[0:8]}-{raw_id[8:12]}-{raw_id[12:16]}-{raw_id[16:20]}-{raw_id[20:32]}"
+                    candidates.add(dashed)
 
                 lat = tag.get("last_lat")
                 lon = tag.get("last_lon")
@@ -95,7 +101,6 @@ async def blekon_webhook(request: Request):
 
                 movement_status = "moving" if tag.get("is_moving") else "static"
 
-                # Choose received_at: prefer updated_at, then last_seen, else now
                 ts = tag.get("updated_at") or tag.get("last_seen")
                 received_at = datetime.utcnow()
                 if isinstance(ts, str):
@@ -104,7 +109,7 @@ async def blekon_webhook(request: Request):
                     except Exception:
                         received_at = datetime.utcnow()
 
-                device = db.query(Device).filter(Device.device_identifier == device_identifier).first()
+                device = db.query(Device).filter(Device.device_identifier.in_(list(candidates))).first()
                 if not device:
                     continue
 
@@ -123,7 +128,7 @@ async def blekon_webhook(request: Request):
                     device_id=device.id,
                     latitude=lat,
                     longitude=lon,
-                    accuracy=None,  # no accuracy provided in vendor payload
+                    accuracy=None,
                     movement_status=movement_status,
                     received_at=received_at
                 )
