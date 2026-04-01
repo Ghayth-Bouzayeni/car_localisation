@@ -147,6 +147,7 @@ class VehicleFrontOut(BaseModel):
     zone: str
     status: str
     device_identifier: Optional[str] = None  # 🔹 Ceci vient de l'association, pas de la table vehicles
+    association_date: Optional[datetime] = None  # 🔹 Date d'association
     last_latitude: Optional[float] = None
     last_longitude: Optional[float] = None
     last_position_time: Optional[datetime] = None

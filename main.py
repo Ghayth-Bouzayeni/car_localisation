@@ -188,6 +188,53 @@ def get_cars_with_positions(db: Session = Depends(get_db)):
             zone=vehicle.zone,
             status=vehicle.status,
             device_identifier=device.device_identifier,
+            association_date=assoc.association_date,
+            last_latitude=float(location.latitude) if location else None,
+            last_longitude=float(location.longitude) if location else None,
+            last_position_time=location.received_at if location else None,
+        ))
+
+    return results
+
+# -------------------
+# Get all associated vehicles with their active device associations
+# -------------------
+@app.get("/vehicles/associated", response_model=list[VehicleFrontOut])
+def get_associated_vehicles(include_positions: bool = Query(True), db: Session = Depends(get_db)):
+    """Get all vehicles with active device associations.
+    
+    Args:
+        include_positions: If True, includes latest position for each vehicle. Default: True
+    
+    Returns:
+        List of vehicles with device_identifier and optionally latest position coordinates.
+    """
+    associations = db.query(VehicleDeviceAssociation).filter(
+        VehicleDeviceAssociation.active == True
+    ).all()
+
+    results = []
+    for assoc in associations:
+        vehicle = db.query(Vehicle).filter(Vehicle.id == assoc.vehicle_id).first()
+        device = db.query(Device).filter(Device.id == assoc.device_id).first()
+        if not vehicle or not device:
+            continue
+
+        location = None
+        if include_positions:
+            location = db.query(Location).filter(
+                Location.device_id == device.id
+            ).order_by(desc(Location.received_at)).first()
+
+        results.append(VehicleFrontOut(
+            id=vehicle.id,
+            vin=vehicle.vin,
+            model=vehicle.model,
+            color=vehicle.color,
+            zone=vehicle.zone,
+            status=vehicle.status,
+            device_identifier=device.device_identifier,
+            association_date=assoc.association_date,
             last_latitude=float(location.latitude) if location else None,
             last_longitude=float(location.longitude) if location else None,
             last_position_time=location.received_at if location else None,
