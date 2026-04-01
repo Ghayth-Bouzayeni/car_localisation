@@ -50,12 +50,18 @@ async def blekon_webhook(request: Request):
         if data and isinstance(data[0], dict) and "type" in data[0]:
             for event in data:
                 if event.get("type") == "network.device_position":
-                    device_identifier = str(event["data"]["device_id"]).lower()
+                    raw_id = str(event["data"]["device_id"]).lower()
+                    base_id = raw_id.removeprefix("urn:uuid:")
+                    candidates = {raw_id, base_id}
+                    if len(base_id) == 32:  # also try dashed UUID form
+                        dashed = f"{base_id[0:8]}-{base_id[8:12]}-{base_id[12:16]}-{base_id[16:20]}-{base_id[20:32]}"
+                        candidates.add(dashed)
+
                     coords = event["data"]["geojson"]["geometry"]["coordinates"]  # [lon, lat]
                     accuracy = event["data"]["quality"].get("accuracy_meters")
                     movement_status = event["data"].get("movement_status", "static")
 
-                    device = db.query(Device).filter(Device.device_identifier == device_identifier).first()
+                    device = db.query(Device).filter(Device.device_identifier.in_(list(candidates))).first()
                     if not device:
                         continue
 
@@ -88,10 +94,10 @@ async def blekon_webhook(request: Request):
                 if not raw_id:
                     continue
 
-                # Accept both dashed and non-dashed forms (BLEcon may drop dashes)
-                candidates = {raw_id}
-                if len(raw_id) == 32:
-                    dashed = f"{raw_id[0:8]}-{raw_id[8:12]}-{raw_id[12:16]}-{raw_id[16:20]}-{raw_id[20:32]}"
+                base_id = raw_id.removeprefix("urn:uuid:")
+                candidates = {raw_id, base_id}
+                if len(base_id) == 32:
+                    dashed = f"{base_id[0:8]}-{base_id[8:12]}-{base_id[12:16]}-{base_id[16:20]}-{base_id[20:32]}"
                     candidates.add(dashed)
 
                 lat = tag.get("last_lat")
