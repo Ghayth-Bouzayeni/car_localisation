@@ -231,17 +231,25 @@ def delete_car(car_id: int, db: Session = Depends(get_db)):
 # -------------------
 @app.post("/associate")
 def associate_vehicle_device(vehicle_id: int, device_identifier: str, db: Session = Depends(get_db)):
-    device_identifier = device_identifier.lower()  # normalize case
+    raw_device_id = device_identifier.lower()
+    base_id = raw_device_id.removeprefix("urn:uuid:")
+    candidates = {raw_device_id, base_id}
+    if len(base_id) == 32:
+        dashed = f"{base_id[0:8]}-{base_id[8:12]}-{base_id[12:16]}-{base_id[16:20]}-{base_id[20:32]}"
+        candidates.add(dashed)
+        canonical = dashed  # store dashed form without prefix
+    else:
+        canonical = base_id  # store prefixless form
 
     # 1️⃣ Vérifier si la voiture existe
     vehicle = db.query(Vehicle).filter(Vehicle.id == vehicle_id).first()
     if not vehicle:
         raise HTTPException(status_code=404, detail="Vehicle not found")
 
-    # 2️⃣ Vérifier si le device existe, sinon le créer
-    device = db.query(Device).filter(Device.device_identifier == device_identifier).first()
+    # 2️⃣ Vérifier si le device existe, sinon le créer (en stockant sans préfixe)
+    device = db.query(Device).filter(Device.device_identifier.in_(list(candidates))).first()
     if not device:
-        device = Device(device_identifier=device_identifier)
+        device = Device(device_identifier=canonical)
         db.add(device)
         db.commit()
         db.refresh(device)
