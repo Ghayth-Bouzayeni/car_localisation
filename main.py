@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Depends, Request, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, func
-from models import Base, Vehicle, Location, Device, VehicleDeviceAssociation
+from models import Base, Vehicle, Location, Device, VehicleDeviceAssociation, MqttBrokerConfig
 from database import SessionLocal, engine
 from schemas import VehicleCreate, VehicleUpdate, VehicleOut, LocationOut, VehicleFrontOut
 import uvicorn
@@ -10,6 +10,8 @@ import os
 import json
 import logging
 import paho.mqtt.client as mqtt
+from pydantic import BaseModel
+from typing import Optional
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -28,6 +30,14 @@ MQTT_PASS = os.getenv("MQTT_PASS", "")
 MQTT_TOPIC = os.getenv("MQTT_TOPIC", "parking/+/+/observations")
 
 mqtt_client: mqtt.Client | None = None
+mqtt_runtime_config = {
+    "enabled": MQTT_ENABLED,
+    "host": MQTT_HOST,
+    "port": MQTT_PORT,
+    "username": MQTT_USER,
+    "password": MQTT_PASS,
+    "topic": MQTT_TOPIC,
+}
 
 
 app.add_middleware(
@@ -47,6 +57,57 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+class MqttConfigIn(BaseModel):
+    host: str
+    port: int = 8883
+    username: str
+    password: str
+    topic: str = "parking/+/+/observations"
+    enabled: bool = True
+
+
+def get_env_mqtt_config() -> dict:
+    return {
+        "enabled": MQTT_ENABLED,
+        "host": MQTT_HOST,
+        "port": MQTT_PORT,
+        "username": MQTT_USER,
+        "password": MQTT_PASS,
+        "topic": MQTT_TOPIC,
+    }
+
+
+def get_db_mqtt_config(db: Session) -> Optional[MqttBrokerConfig]:
+    return db.query(MqttBrokerConfig).filter(MqttBrokerConfig.is_active == True).order_by(MqttBrokerConfig.id.desc()).first()
+
+
+def get_effective_mqtt_config() -> dict:
+    db = SessionLocal()
+    try:
+        db_cfg = get_db_mqtt_config(db)
+        if db_cfg:
+            return {
+                "enabled": db_cfg.enabled,
+                "host": db_cfg.host,
+                "port": db_cfg.port,
+                "username": db_cfg.username,
+                "password": db_cfg.password,
+                "topic": db_cfg.topic,
+            }
+    finally:
+        db.close()
+    return get_env_mqtt_config()
+
+
+def set_runtime_mqtt_config(config: dict):
+    mqtt_runtime_config["enabled"] = bool(config.get("enabled", True))
+    mqtt_runtime_config["host"] = str(config.get("host", ""))
+    mqtt_runtime_config["port"] = int(config.get("port", 8883))
+    mqtt_runtime_config["username"] = str(config.get("username", ""))
+    mqtt_runtime_config["password"] = str(config.get("password", ""))
+    mqtt_runtime_config["topic"] = str(config.get("topic", "parking/+/+/observations"))
 
 
 def build_device_candidates(identifier: str) -> list[str]:
@@ -162,8 +223,8 @@ def process_mqtt_observation(message: dict):
 
 def on_mqtt_connect(client, userdata, flags, rc, *args):
     if rc == 0:
-        logger.info("MQTT connected, subscribing to %s", MQTT_TOPIC)
-        client.subscribe(MQTT_TOPIC)
+        logger.info("MQTT connected, subscribing to %s", mqtt_runtime_config["topic"])
+        client.subscribe(mqtt_runtime_config["topic"])
     else:
         logger.error("MQTT connection failed with rc=%s", rc)
 
@@ -179,32 +240,32 @@ def on_mqtt_message(client, userdata, msg):
         process_mqtt_observation(payload)
 
 
-@app.on_event("startup")
-def start_mqtt_subscriber():
+def start_mqtt_subscriber(config: dict):
     global mqtt_client
 
-    if not MQTT_ENABLED:
-        logger.info("MQTT subscriber disabled (MQTT_ENABLED=false)")
+    set_runtime_mqtt_config(config)
+
+    if not mqtt_runtime_config["enabled"]:
+        logger.info("MQTT subscriber disabled (enabled=false)")
         return
 
-    if not all([MQTT_HOST, MQTT_USER, MQTT_PASS, MQTT_TOPIC]):
-        logger.warning("MQTT subscriber not started: missing MQTT_* env vars")
+    if not all([mqtt_runtime_config["host"], mqtt_runtime_config["username"], mqtt_runtime_config["password"], mqtt_runtime_config["topic"]]):
+        logger.warning("MQTT subscriber not started: missing MQTT config")
         return
 
     try:
         mqtt_client = mqtt.Client(client_id=f"blekon-api-{os.getpid()}")
-        mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
+        mqtt_client.username_pw_set(mqtt_runtime_config["username"], mqtt_runtime_config["password"])
         mqtt_client.tls_set()
         mqtt_client.on_connect = on_mqtt_connect
         mqtt_client.on_message = on_mqtt_message
-        mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
+        mqtt_client.connect(mqtt_runtime_config["host"], mqtt_runtime_config["port"], keepalive=60)
         mqtt_client.loop_start()
         logger.info("MQTT subscriber started")
     except Exception as exc:
         logger.error("Failed to start MQTT subscriber: %s", exc)
 
 
-@app.on_event("shutdown")
 def stop_mqtt_subscriber():
     global mqtt_client
 
@@ -217,6 +278,23 @@ def stop_mqtt_subscriber():
         logger.info("MQTT subscriber stopped")
     except Exception as exc:
         logger.error("Failed to stop MQTT subscriber: %s", exc)
+    finally:
+        mqtt_client = None
+
+
+def restart_mqtt_subscriber(config: dict):
+    stop_mqtt_subscriber()
+    start_mqtt_subscriber(config)
+
+
+@app.on_event("startup")
+def app_startup_mqtt_subscriber():
+    start_mqtt_subscriber(get_effective_mqtt_config())
+
+
+@app.on_event("shutdown")
+def app_shutdown_mqtt_subscriber():
+    stop_mqtt_subscriber()
 
 # -------------------
 # Webhook pour positions
@@ -267,6 +345,72 @@ async def blekon_webhook(request: Request):
                 )
 
     return {"status": "ok"}
+
+
+# -------------------
+# MQTT admin config (no auth, as requested)
+# -------------------
+@app.get("/admin/mqtt/config")
+def get_mqtt_config(db: Session = Depends(get_db)):
+    db_cfg = get_db_mqtt_config(db)
+    if db_cfg:
+        return {
+            "source": "database",
+            "enabled": db_cfg.enabled,
+            "host": db_cfg.host,
+            "port": db_cfg.port,
+            "username": db_cfg.username,
+            "topic": db_cfg.topic,
+            "is_active": db_cfg.is_active,
+        }
+
+    env_cfg = get_env_mqtt_config()
+    return {
+        "source": "environment",
+        "enabled": env_cfg["enabled"],
+        "host": env_cfg["host"],
+        "port": env_cfg["port"],
+        "username": env_cfg["username"],
+        "topic": env_cfg["topic"],
+        "is_active": True,
+    }
+
+
+@app.put("/admin/mqtt/config")
+def update_mqtt_config(payload: MqttConfigIn, db: Session = Depends(get_db)):
+    db.query(MqttBrokerConfig).filter(MqttBrokerConfig.is_active == True).update({"is_active": False})
+
+    new_cfg = MqttBrokerConfig(
+        host=payload.host,
+        port=payload.port,
+        username=payload.username,
+        password=payload.password,
+        topic=payload.topic,
+        enabled=payload.enabled,
+        is_active=True,
+    )
+    db.add(new_cfg)
+    db.commit()
+
+    restart_mqtt_subscriber(
+        {
+            "enabled": payload.enabled,
+            "host": payload.host,
+            "port": payload.port,
+            "username": payload.username,
+            "password": payload.password,
+            "topic": payload.topic,
+        }
+    )
+
+    return {
+        "message": "MQTT config updated and subscriber restarted",
+        "enabled": payload.enabled,
+        "host": payload.host,
+        "port": payload.port,
+        "username": payload.username,
+        "topic": payload.topic,
+    }
 
 # -------------------
 # Gestion des voitures
