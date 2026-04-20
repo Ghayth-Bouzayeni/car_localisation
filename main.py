@@ -730,21 +730,46 @@ def associate_vehicle_device(vehicle_id: int, device_identifier: str, db: Sessio
         db.commit()
         db.refresh(device)
 
-    # 3️⃣ Désactiver les anciennes associations pour ce device
+    # Si déjà associé activement à ce même véhicule, rien à changer.
+    existing_same = db.query(VehicleDeviceAssociation).filter(
+        VehicleDeviceAssociation.vehicle_id == vehicle.id,
+        VehicleDeviceAssociation.device_id == device.id,
+        VehicleDeviceAssociation.active == True
+    ).first()
+    if existing_same:
+        return {
+            "vehicle_id": vehicle.id,
+            "device_id": device.device_identifier,
+            "association_active": True,
+            "message": "Association déjà active"
+        }
+
+    now = datetime.utcnow()
+
+    # 3️⃣ Désactiver l'ancienne association active de CE véhicule (si existe)
+    db.query(VehicleDeviceAssociation).filter(
+        VehicleDeviceAssociation.vehicle_id == vehicle.id,
+        VehicleDeviceAssociation.active == True
+    ).update({
+        "active": False,
+        "disassociation_date": now
+    })
+
+    # 4️⃣ Désactiver les anciennes associations pour ce device
     db.query(VehicleDeviceAssociation).filter(
         VehicleDeviceAssociation.device_id == device.id,
         VehicleDeviceAssociation.active == True
     ).update({
         "active": False,
-        "disassociation_date": datetime.utcnow()
+        "disassociation_date": now
     })
 
-    # 4️⃣ Créer la nouvelle association
+    # 5️⃣ Créer la nouvelle association
     new_association = VehicleDeviceAssociation(
         vehicle_id=vehicle.id,
         device_id=device.id,
         active=True,
-        association_date=datetime.utcnow()
+        association_date=now
     )
     db.add(new_association)
     db.commit()
@@ -768,7 +793,7 @@ def get_vehicle_device(vehicle_id: int, db: Session = Depends(get_db)):
     association = db.query(VehicleDeviceAssociation).filter(
         VehicleDeviceAssociation.vehicle_id == vehicle_id,
         VehicleDeviceAssociation.active == True
-    ).first()
+    ).order_by(desc(VehicleDeviceAssociation.association_date)).first()
     
     if not association:
         return {"vehicle_id": vehicle_id, "device_id": None, "message": "Aucun device associé"}
@@ -796,7 +821,7 @@ def get_latest_positions(car_id: int = Query(None), db: Session = Depends(get_db
         association = db.query(VehicleDeviceAssociation).filter(
             VehicleDeviceAssociation.vehicle_id == car_id,
             VehicleDeviceAssociation.active == True
-        ).first()
+        ).order_by(desc(VehicleDeviceAssociation.association_date)).first()
         
         if not association:
             return []  # Pas de device associé
