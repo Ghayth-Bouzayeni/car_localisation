@@ -1,9 +1,9 @@
 from fastapi import FastAPI, HTTPException, Depends, Request, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, func
-from models import Base, Vehicle, Location, Device, VehicleDeviceAssociation, MqttBrokerConfig
+from models import Base, Vehicle, Location, Device, VehicleDeviceAssociation, MqttBrokerConfig, Zone
 from database import SessionLocal, engine
-from schemas import VehicleCreate, VehicleUpdate, VehicleOut, LocationOut, VehicleFrontOut
+from schemas import VehicleCreate, VehicleUpdate, VehicleOut, LocationOut, VehicleFrontOut, ZoneCreate, ZoneUpdate, ZoneOut
 import uvicorn
 from datetime import datetime, timezone
 import os
@@ -143,6 +143,53 @@ def parse_received_at(ts: str | None) -> datetime:
     return datetime.utcnow()
 
 
+def parse_zone_points(points_json: str) -> list[dict]:
+    try:
+        points = json.loads(points_json)
+        if isinstance(points, list):
+            return points
+    except Exception:
+        pass
+    return []
+
+
+def is_point_in_polygon(lat: float, lon: float, polygon: list[dict]) -> bool:
+    # Ray-casting algorithm: odd intersections => inside polygon.
+    n = len(polygon)
+    if n < 3:
+        return False
+
+    inside = False
+    j = n - 1
+    for i in range(n):
+        yi = polygon[i].get("lat")
+        xi = polygon[i].get("lon")
+        yj = polygon[j].get("lat")
+        xj = polygon[j].get("lon")
+
+        if yi is None or xi is None or yj is None or xj is None:
+            j = i
+            continue
+
+        intersects = ((yi > lat) != (yj > lat)) and (
+            lon < (xj - xi) * (lat - yi) / ((yj - yi) if (yj - yi) != 0 else 1e-12) + xi
+        )
+        if intersects:
+            inside = not inside
+        j = i
+
+    return inside
+
+
+def find_zone_name_for_location(db: Session, lat: float, lon: float) -> str | None:
+    zones = db.query(Zone).filter(Zone.active == True).all()
+    for zone in zones:
+        points = parse_zone_points(zone.points_json)
+        if is_point_in_polygon(lat, lon, points):
+            return zone.name
+    return None
+
+
 def save_location_for_identifier(
     db: Session,
     identifier: str,
@@ -180,6 +227,14 @@ def save_location_for_identifier(
         received_at=received_at,
     )
     db.add(location)
+
+    # Classify current vehicle zone by latest location against active polygons.
+    zone_name = find_zone_name_for_location(db, latitude, longitude)
+    if zone_name:
+        vehicle.zone = zone_name
+    else:
+        vehicle.zone = "Hors zone"
+
     db.commit()
     return True
 
@@ -410,6 +465,111 @@ def update_mqtt_config(payload: MqttConfigIn, db: Session = Depends(get_db)):
         "port": payload.port,
         "username": payload.username,
         "topic": payload.topic,
+    }
+
+
+# -------------------
+# Zones APIs (frontend draws min 3 points on map)
+# -------------------
+@app.post("/zones", response_model=ZoneOut)
+def create_zone(payload: ZoneCreate, db: Session = Depends(get_db)):
+    existing = db.query(Zone).filter(Zone.name == payload.name).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Zone name already exists")
+
+    zone = Zone(
+        name=payload.name,
+        points_json=json.dumps([{"lat": p.lat, "lon": p.lon} for p in payload.points]),
+        active=True,
+    )
+    db.add(zone)
+    db.commit()
+    db.refresh(zone)
+
+    return ZoneOut(
+        id=zone.id,
+        name=zone.name,
+        points=parse_zone_points(zone.points_json),
+        active=zone.active,
+        created_at=zone.created_at,
+        updated_at=zone.updated_at,
+    )
+
+
+@app.get("/zones", response_model=list[ZoneOut])
+def list_zones(active_only: bool = Query(True), db: Session = Depends(get_db)):
+    query = db.query(Zone)
+    if active_only:
+        query = query.filter(Zone.active == True)
+
+    zones = query.order_by(Zone.id.asc()).all()
+    return [
+        ZoneOut(
+            id=z.id,
+            name=z.name,
+            points=parse_zone_points(z.points_json),
+            active=z.active,
+            created_at=z.created_at,
+            updated_at=z.updated_at,
+        )
+        for z in zones
+    ]
+
+
+@app.put("/zones/{zone_id}", response_model=ZoneOut)
+def update_zone(zone_id: int, payload: ZoneUpdate, db: Session = Depends(get_db)):
+    zone = db.query(Zone).filter(Zone.id == zone_id).first()
+    if not zone:
+        raise HTTPException(status_code=404, detail="Zone not found")
+
+    if payload.name is not None:
+        conflict = db.query(Zone).filter(Zone.name == payload.name, Zone.id != zone_id).first()
+        if conflict:
+            raise HTTPException(status_code=400, detail="Zone name already exists")
+        zone.name = payload.name
+
+    if payload.points is not None:
+        zone.points_json = json.dumps([{"lat": p.lat, "lon": p.lon} for p in payload.points])
+
+    if payload.active is not None:
+        zone.active = payload.active
+
+    zone.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(zone)
+
+    return ZoneOut(
+        id=zone.id,
+        name=zone.name,
+        points=parse_zone_points(zone.points_json),
+        active=zone.active,
+        created_at=zone.created_at,
+        updated_at=zone.updated_at,
+    )
+
+
+@app.delete("/zones/{zone_id}")
+def delete_zone(zone_id: int, db: Session = Depends(get_db)):
+    zone = db.query(Zone).filter(Zone.id == zone_id).first()
+    if not zone:
+        raise HTTPException(status_code=404, detail="Zone not found")
+
+    zone.active = False
+    zone.updated_at = datetime.utcnow()
+    db.commit()
+    return {"message": "Zone deactivated successfully", "zone_id": zone_id}
+
+
+@app.get("/vehicles/{vehicle_id}/zone")
+def get_vehicle_zone(vehicle_id: int, db: Session = Depends(get_db)):
+    vehicle = db.query(Vehicle).filter(Vehicle.id == vehicle_id).first()
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+
+    return {
+        "vehicle_id": vehicle.id,
+        "zone": vehicle.zone,
+        "message": "Current zone based on last processed location"
     }
 
 # -------------------

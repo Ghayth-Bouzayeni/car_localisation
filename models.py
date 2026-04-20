@@ -98,6 +98,21 @@ class Alert(Base):
 
 
 # -------------------
+# ZONES (POLYGONS DRAWN BY FRONTEND)
+# -------------------
+class Zone(Base):
+    __tablename__ = "zones"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), unique=True, nullable=False)
+    # Stored as JSON string: [{"lat": ..., "lon": ...}, ...]
+    points_json = Column(String, nullable=False)
+    active = Column(Boolean, default=True)
+    created_at = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))
+    updated_at = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))
+
+
+# -------------------
 # MQTT BROKER CONFIGS
 # -------------------
 class MqttBrokerConfig(Base):
