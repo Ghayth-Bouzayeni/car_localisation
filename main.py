@@ -554,10 +554,22 @@ def delete_zone(zone_id: int, db: Session = Depends(get_db)):
     if not zone:
         raise HTTPException(status_code=404, detail="Zone not found")
 
-    zone.active = False
-    zone.updated_at = datetime.utcnow()
+    deleted_zone_name = zone.name
+
+    # Reset vehicles currently assigned to this zone name.
+    db.query(Vehicle).filter(Vehicle.zone == deleted_zone_name).update(
+        {"zone": "Hors zone"},
+        synchronize_session=False
+    )
+
+    db.delete(zone)
     db.commit()
-    return {"message": "Zone deactivated successfully", "zone_id": zone_id}
+    return {
+        "message": "Zone deleted successfully",
+        "zone_id": zone_id,
+        "cleared_zone_name": deleted_zone_name,
+        "vehicles_updated_to": "Hors zone"
+    }
 
 
 @app.get("/vehicles/{vehicle_id}/zone")
