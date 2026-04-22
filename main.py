@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import os
 import json
 import logging
+import threading
 import paho.mqtt.client as mqtt
 from pydantic import BaseModel
 from typing import Optional
@@ -37,6 +38,29 @@ mqtt_runtime_config = {
     "username": MQTT_USER,
     "password": MQTT_PASS,
     "topic": MQTT_TOPIC,
+}
+
+mqtt_debug_lock = threading.Lock()
+mqtt_debug_state = {
+    "client_started": False,
+    "connected": False,
+    "subscribed": False,
+    "subscribed_topic": None,
+    "last_connect_rc": None,
+    "last_connect_at": None,
+    "last_disconnect_at": None,
+    "last_disconnect_rc": None,
+    "last_message_at": None,
+    "last_message_topic": None,
+    "last_payload_size": 0,
+    "last_payload_devices": 0,
+    "last_payload_saved": 0,
+    "messages_received": 0,
+    "payloads_processed": 0,
+    "locations_saved": 0,
+    "decode_errors": 0,
+    "last_error": None,
+    "last_error_at": None,
 }
 
 
@@ -110,21 +134,38 @@ def set_runtime_mqtt_config(config: dict):
     mqtt_runtime_config["topic"] = str(config.get("topic", "parking/+/+/observations"))
 
 
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def update_mqtt_debug_state(**changes):
+    with mqtt_debug_lock:
+        mqtt_debug_state.update(changes)
+
+
+def get_mqtt_debug_snapshot() -> dict:
+    with mqtt_debug_lock:
+        return dict(mqtt_debug_state)
+
+
 def build_device_candidates(identifier: str) -> list[str]:
     raw_id = str(identifier or "").strip().lower()
     if not raw_id:
         return []
 
     base_id = raw_id.removeprefix("urn:uuid:")
-    candidates = {raw_id, base_id}
+    no_dash_id = base_id.replace("-", "")
+    candidates = {raw_id, base_id, no_dash_id}
 
     # Include prefixed variants to support historical values in DB.
     if base_id:
         candidates.add(f"urn:uuid:{base_id}")
+    if no_dash_id:
+        candidates.add(f"urn:uuid:{no_dash_id}")
 
-    # If UUID arrives without dashes, also try dashed representation.
-    if len(base_id) == 32:
-        dashed = f"{base_id[0:8]}-{base_id[8:12]}-{base_id[12:16]}-{base_id[16:20]}-{base_id[20:32]}"
+    # Always try dashed UUID representation when we have 32 hex chars.
+    if len(no_dash_id) == 32:
+        dashed = f"{no_dash_id[0:8]}-{no_dash_id[8:12]}-{no_dash_id[12:16]}-{no_dash_id[16:20]}-{no_dash_id[20:32]}"
         candidates.add(dashed)
         candidates.add(f"urn:uuid:{dashed}")
 
@@ -239,14 +280,15 @@ def save_location_for_identifier(
     return True
 
 
-def process_mqtt_observation(message: dict):
+def process_mqtt_observation(message: dict) -> dict:
     ble_scan = message.get("ble_scan") or {}
     devices = ble_scan.get("devices") or []
     fallback_ts = message.get("timestamp")
 
     if not isinstance(devices, list):
-        return
+        return {"devices": 0, "saved": 0}
 
+    saved_count = 0
     db = SessionLocal()
     try:
         for dev in devices:
@@ -263,7 +305,7 @@ def process_mqtt_observation(message: dict):
             received_at = parse_received_at(dev.get("last_seen") or fallback_ts)
             accuracy = dev.get("accuracy")
 
-            save_location_for_identifier(
+            saved = save_location_for_identifier(
                 db=db,
                 identifier=tag_id,
                 latitude=lat,
@@ -272,27 +314,76 @@ def process_mqtt_observation(message: dict):
                 movement_status=movement_status,
                 received_at=received_at,
             )
+            if saved:
+                saved_count += 1
     finally:
         db.close()
 
+    return {"devices": len(devices), "saved": saved_count}
+
 
 def on_mqtt_connect(client, userdata, flags, rc, *args):
+    now = utc_now_iso()
+    update_mqtt_debug_state(last_connect_rc=rc, last_connect_at=now)
     if rc == 0:
         logger.info("MQTT connected, subscribing to %s", mqtt_runtime_config["topic"])
+        update_mqtt_debug_state(connected=True, subscribed=False, subscribed_topic=None)
         client.subscribe(mqtt_runtime_config["topic"])
     else:
+        update_mqtt_debug_state(connected=False, subscribed=False)
         logger.error("MQTT connection failed with rc=%s", rc)
 
 
+def on_mqtt_disconnect(client, userdata, rc, *args):
+    update_mqtt_debug_state(
+        connected=False,
+        subscribed=False,
+        last_disconnect_rc=rc,
+        last_disconnect_at=utc_now_iso(),
+    )
+    logger.warning("MQTT disconnected with rc=%s", rc)
+
+
+def on_mqtt_subscribe(client, userdata, mid, granted_qos, *args):
+    update_mqtt_debug_state(
+        subscribed=True,
+        subscribed_topic=mqtt_runtime_config["topic"],
+    )
+    logger.info("MQTT subscribed to %s with qos=%s", mqtt_runtime_config["topic"], granted_qos)
+
+
 def on_mqtt_message(client, userdata, msg):
+    now = utc_now_iso()
+    update_mqtt_debug_state(
+        last_message_at=now,
+        last_message_topic=msg.topic,
+        last_payload_size=len(msg.payload or b""),
+    )
+
+    snap = get_mqtt_debug_snapshot()
+    update_mqtt_debug_state(messages_received=snap["messages_received"] + 1)
+
     try:
         payload = json.loads(msg.payload.decode("utf-8"))
     except Exception as exc:
+        snap = get_mqtt_debug_snapshot()
+        update_mqtt_debug_state(
+            decode_errors=snap["decode_errors"] + 1,
+            last_error=str(exc),
+            last_error_at=now,
+        )
         logger.error("MQTT payload decode error: %s", exc)
         return
 
     if isinstance(payload, dict):
-        process_mqtt_observation(payload)
+        result = process_mqtt_observation(payload)
+        snap = get_mqtt_debug_snapshot()
+        update_mqtt_debug_state(
+            payloads_processed=snap["payloads_processed"] + 1,
+            locations_saved=snap["locations_saved"] + result["saved"],
+            last_payload_devices=result["devices"],
+            last_payload_saved=result["saved"],
+        )
 
 
 def start_mqtt_subscriber(config: dict):
@@ -313,11 +404,21 @@ def start_mqtt_subscriber(config: dict):
         mqtt_client.username_pw_set(mqtt_runtime_config["username"], mqtt_runtime_config["password"])
         mqtt_client.tls_set()
         mqtt_client.on_connect = on_mqtt_connect
+        mqtt_client.on_disconnect = on_mqtt_disconnect
+        mqtt_client.on_subscribe = on_mqtt_subscribe
         mqtt_client.on_message = on_mqtt_message
         mqtt_client.connect(mqtt_runtime_config["host"], mqtt_runtime_config["port"], keepalive=60)
         mqtt_client.loop_start()
+        update_mqtt_debug_state(client_started=True, last_error=None)
         logger.info("MQTT subscriber started")
     except Exception as exc:
+        update_mqtt_debug_state(
+            client_started=False,
+            connected=False,
+            subscribed=False,
+            last_error=str(exc),
+            last_error_at=utc_now_iso(),
+        )
         logger.error("Failed to start MQTT subscriber: %s", exc)
 
 
@@ -330,8 +431,10 @@ def stop_mqtt_subscriber():
     try:
         mqtt_client.loop_stop()
         mqtt_client.disconnect()
+        update_mqtt_debug_state(client_started=False, connected=False, subscribed=False)
         logger.info("MQTT subscriber stopped")
     except Exception as exc:
+        update_mqtt_debug_state(last_error=str(exc), last_error_at=utc_now_iso())
         logger.error("Failed to stop MQTT subscriber: %s", exc)
     finally:
         mqtt_client = None
@@ -656,6 +759,19 @@ def get_associated_vehicles(include_positions: bool = Query(True), db: Session =
 
     results = []
     for assoc in associations:
+
+
+@app.get("/admin/mqtt/debug")
+def get_mqtt_debug():
+    state = get_mqtt_debug_snapshot()
+    state["runtime_config"] = {
+        "enabled": mqtt_runtime_config["enabled"],
+        "host": mqtt_runtime_config["host"],
+        "port": mqtt_runtime_config["port"],
+        "username": mqtt_runtime_config["username"],
+        "topic": mqtt_runtime_config["topic"],
+    }
+    return state
         vehicle = db.query(Vehicle).filter(Vehicle.id == assoc.vehicle_id).first()
         device = db.query(Device).filter(Device.id == assoc.device_id).first()
         if not vehicle or not device:
@@ -721,13 +837,13 @@ def delete_car(car_id: int, db: Session = Depends(get_db)):
 def associate_vehicle_device(vehicle_id: int, device_identifier: str, db: Session = Depends(get_db)):
     raw_device_id = device_identifier.lower()
     base_id = raw_device_id.removeprefix("urn:uuid:")
-    candidates = {raw_device_id, base_id}
-    if len(base_id) == 32:
-        dashed = f"{base_id[0:8]}-{base_id[8:12]}-{base_id[12:16]}-{base_id[16:20]}-{base_id[20:32]}"
-        candidates.add(dashed)
+    no_dash_id = base_id.replace("-", "")
+    candidates = set(build_device_candidates(device_identifier))
+    if len(no_dash_id) == 32:
+        dashed = f"{no_dash_id[0:8]}-{no_dash_id[8:12]}-{no_dash_id[12:16]}-{no_dash_id[16:20]}-{no_dash_id[20:32]}"
         canonical = dashed  # store dashed form without prefix
     else:
-        canonical = base_id  # store prefixless form
+        canonical = base_id  # fallback as-is without prefix
 
     # 1️⃣ Vérifier si la voiture existe
     vehicle = db.query(Vehicle).filter(Vehicle.id == vehicle_id).first()
