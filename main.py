@@ -759,19 +759,6 @@ def get_associated_vehicles(include_positions: bool = Query(True), db: Session =
 
     results = []
     for assoc in associations:
-
-
-@app.get("/admin/mqtt/debug")
-def get_mqtt_debug():
-    state = get_mqtt_debug_snapshot()
-    state["runtime_config"] = {
-        "enabled": mqtt_runtime_config["enabled"],
-        "host": mqtt_runtime_config["host"],
-        "port": mqtt_runtime_config["port"],
-        "username": mqtt_runtime_config["username"],
-        "topic": mqtt_runtime_config["topic"],
-    }
-    return state
         vehicle = db.query(Vehicle).filter(Vehicle.id == assoc.vehicle_id).first()
         device = db.query(Device).filter(Device.id == assoc.device_id).first()
         if not vehicle or not device:
@@ -798,6 +785,19 @@ def get_mqtt_debug():
         ))
 
     return results
+
+
+@app.get("/admin/mqtt/debug")
+def get_mqtt_debug():
+    state = get_mqtt_debug_snapshot()
+    state["runtime_config"] = {
+        "enabled": mqtt_runtime_config["enabled"],
+        "host": mqtt_runtime_config["host"],
+        "port": mqtt_runtime_config["port"],
+        "username": mqtt_runtime_config["username"],
+        "topic": mqtt_runtime_config["topic"],
+    }
+    return state
 
 @app.get("/cars/{car_id}", response_model=VehicleOut)
 def get_car(car_id: int, db: Session = Depends(get_db)):
