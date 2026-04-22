@@ -909,6 +909,47 @@ def associate_vehicle_device(vehicle_id: int, device_identifier: str, db: Sessio
         "message": "Association créée avec succès"
     }
 
+
+@app.delete("/associate")
+def delete_vehicle_device_association(
+    vehicle_id: int,
+    device_identifier: Optional[str] = Query(None),
+    only_active: bool = Query(True),
+    db: Session = Depends(get_db),
+):
+    vehicle = db.query(Vehicle).filter(Vehicle.id == vehicle_id).first()
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+
+    query = db.query(VehicleDeviceAssociation).filter(
+        VehicleDeviceAssociation.vehicle_id == vehicle_id
+    )
+
+    if only_active:
+        query = query.filter(VehicleDeviceAssociation.active == True)
+
+    if device_identifier:
+        candidates = build_device_candidates(device_identifier)
+        device_ids = [row[0] for row in db.query(Device.id).filter(Device.device_identifier.in_(candidates)).all()]
+        if not device_ids:
+            raise HTTPException(status_code=404, detail="Device not found for provided identifier")
+        query = query.filter(VehicleDeviceAssociation.device_id.in_(device_ids))
+
+    associations = query.all()
+    if not associations:
+        raise HTTPException(status_code=404, detail="No matching association found")
+
+    deleted_count = len(associations)
+    for association in associations:
+        db.delete(association)
+
+    db.commit()
+    return {
+        "vehicle_id": vehicle_id,
+        "deleted_associations": deleted_count,
+        "message": "Association(s) deleted from database",
+    }
+
 # -------------------
 # Obtenir le device associé à un véhicule
 # -------------------
