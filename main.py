@@ -23,6 +23,11 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI(title="BLEkon API")
 logger = logging.getLogger("blekon_api")
 
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
 MQTT_ENABLED = os.getenv("MQTT_ENABLED", "true").lower() == "true"
 MQTT_HOST = os.getenv("MQTT_HOST", "")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
