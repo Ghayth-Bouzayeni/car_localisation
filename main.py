@@ -28,6 +28,11 @@ logger = logging.getLogger("blekon_api")
 def health_check():
     return {"status": "ok"}
 
+
+@app.head("/health")
+def health_check_head():
+    return {}
+
 MQTT_ENABLED = os.getenv("MQTT_ENABLED", "true").lower() == "true"
 MQTT_HOST = os.getenv("MQTT_HOST", "")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
