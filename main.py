@@ -1,11 +1,18 @@
 from fastapi import FastAPI, HTTPException, Depends, Request, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, func
-from models import Base, Vehicle, Location, Device, VehicleDeviceAssociation
+from models import Base, Vehicle, Location, Device, VehicleDeviceAssociation, MqttBrokerConfig, Zone
 from database import SessionLocal, engine
-from schemas import VehicleCreate, VehicleUpdate, VehicleOut, LocationOut, VehicleFrontOut
+from schemas import VehicleCreate, VehicleUpdate, VehicleOut, LocationOut, VehicleFrontOut, ZoneCreate, ZoneUpdate, ZoneOut
 import uvicorn
-from datetime import datetime
+from datetime import datetime, timezone
+import os
+import json
+import logging
+import threading
+import paho.mqtt.client as mqtt
+from pydantic import BaseModel
+from typing import Optional
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -14,6 +21,52 @@ from fastapi.middleware.cors import CORSMiddleware
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="BLEkon API")
+logger = logging.getLogger("blekon_api")
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+MQTT_ENABLED = os.getenv("MQTT_ENABLED", "true").lower() == "true"
+MQTT_HOST = os.getenv("MQTT_HOST", "")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
+MQTT_USER = os.getenv("MQTT_USER", "")
+MQTT_PASS = os.getenv("MQTT_PASS", "")
+MQTT_TOPIC = os.getenv("MQTT_TOPIC", "parking/+/+/observations")
+
+mqtt_client: mqtt.Client | None = None
+mqtt_runtime_config = {
+    "enabled": MQTT_ENABLED,
+    "host": MQTT_HOST,
+    "port": MQTT_PORT,
+    "username": MQTT_USER,
+    "password": MQTT_PASS,
+    "topic": MQTT_TOPIC,
+}
+
+mqtt_debug_lock = threading.Lock()
+mqtt_debug_state = {
+    "client_started": False,
+    "connected": False,
+    "subscribed": False,
+    "subscribed_topic": None,
+    "last_connect_rc": None,
+    "last_connect_at": None,
+    "last_disconnect_at": None,
+    "last_disconnect_rc": None,
+    "last_message_at": None,
+    "last_message_topic": None,
+    "last_payload_size": 0,
+    "last_payload_devices": 0,
+    "last_payload_saved": 0,
+    "messages_received": 0,
+    "payloads_processed": 0,
+    "locations_saved": 0,
+    "decode_errors": 0,
+    "last_error": None,
+    "last_error_at": None,
+}
 
 
 app.add_middleware(
@@ -34,6 +87,378 @@ def get_db():
     finally:
         db.close()
 
+
+class MqttConfigIn(BaseModel):
+    host: str
+    port: int = 8883
+    username: str
+    password: str
+    topic: str = "parking/+/+/observations"
+    enabled: bool = True
+
+
+def get_env_mqtt_config() -> dict:
+    return {
+        "enabled": MQTT_ENABLED,
+        "host": MQTT_HOST,
+        "port": MQTT_PORT,
+        "username": MQTT_USER,
+        "password": MQTT_PASS,
+        "topic": MQTT_TOPIC,
+    }
+
+
+def get_db_mqtt_config(db: Session) -> Optional[MqttBrokerConfig]:
+    return db.query(MqttBrokerConfig).filter(MqttBrokerConfig.is_active == True).order_by(MqttBrokerConfig.id.desc()).first()
+
+
+def get_effective_mqtt_config() -> dict:
+    db = SessionLocal()
+    try:
+        db_cfg = get_db_mqtt_config(db)
+        if db_cfg:
+            return {
+                "enabled": db_cfg.enabled,
+                "host": db_cfg.host,
+                "port": db_cfg.port,
+                "username": db_cfg.username,
+                "password": db_cfg.password,
+                "topic": db_cfg.topic,
+            }
+    finally:
+        db.close()
+    return get_env_mqtt_config()
+
+
+def set_runtime_mqtt_config(config: dict):
+    mqtt_runtime_config["enabled"] = bool(config.get("enabled", True))
+    mqtt_runtime_config["host"] = str(config.get("host", ""))
+    mqtt_runtime_config["port"] = int(config.get("port", 8883))
+    mqtt_runtime_config["username"] = str(config.get("username", ""))
+    mqtt_runtime_config["password"] = str(config.get("password", ""))
+    mqtt_runtime_config["topic"] = str(config.get("topic", "parking/+/+/observations"))
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def update_mqtt_debug_state(**changes):
+    with mqtt_debug_lock:
+        mqtt_debug_state.update(changes)
+
+
+def get_mqtt_debug_snapshot() -> dict:
+    with mqtt_debug_lock:
+        return dict(mqtt_debug_state)
+
+
+def build_device_candidates(identifier: str) -> list[str]:
+    raw_id = str(identifier or "").strip().lower()
+    if not raw_id:
+        return []
+
+    base_id = raw_id.removeprefix("urn:uuid:")
+    no_dash_id = base_id.replace("-", "")
+    candidates = {raw_id, base_id, no_dash_id}
+
+    # Include prefixed variants to support historical values in DB.
+    if base_id:
+        candidates.add(f"urn:uuid:{base_id}")
+    if no_dash_id:
+        candidates.add(f"urn:uuid:{no_dash_id}")
+
+    # Always try dashed UUID representation when we have 32 hex chars.
+    if len(no_dash_id) == 32:
+        dashed = f"{no_dash_id[0:8]}-{no_dash_id[8:12]}-{no_dash_id[12:16]}-{no_dash_id[16:20]}-{no_dash_id[20:32]}"
+        candidates.add(dashed)
+        candidates.add(f"urn:uuid:{dashed}")
+
+    return [item for item in candidates if item]
+
+
+def parse_received_at(ts: str | None) -> datetime:
+    if isinstance(ts, str):
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if dt.tzinfo is not None:
+                return dt.astimezone(timezone.utc).replace(tzinfo=None)
+            return dt
+        except Exception:
+            pass
+    return datetime.utcnow()
+
+
+def parse_zone_points(points_json: str) -> list[dict]:
+    try:
+        points = json.loads(points_json)
+        if isinstance(points, list):
+            return points
+    except Exception:
+        pass
+    return []
+
+
+def is_point_in_polygon(lat: float, lon: float, polygon: list[dict]) -> bool:
+    # Ray-casting algorithm: odd intersections => inside polygon.
+    n = len(polygon)
+    if n < 3:
+        return False
+
+    inside = False
+    j = n - 1
+    for i in range(n):
+        yi = polygon[i].get("lat")
+        xi = polygon[i].get("lon")
+        yj = polygon[j].get("lat")
+        xj = polygon[j].get("lon")
+
+        if yi is None or xi is None or yj is None or xj is None:
+            j = i
+            continue
+
+        intersects = ((yi > lat) != (yj > lat)) and (
+            lon < (xj - xi) * (lat - yi) / ((yj - yi) if (yj - yi) != 0 else 1e-12) + xi
+        )
+        if intersects:
+            inside = not inside
+        j = i
+
+    return inside
+
+
+def find_zone_name_for_location(db: Session, lat: float, lon: float) -> str | None:
+    zones = db.query(Zone).filter(Zone.active == True).all()
+    for zone in zones:
+        points = parse_zone_points(zone.points_json)
+        if is_point_in_polygon(lat, lon, points):
+            return zone.name
+    return None
+
+
+def save_location_for_identifier(
+    db: Session,
+    identifier: str,
+    latitude: float,
+    longitude: float,
+    accuracy: float | None,
+    movement_status: str,
+    received_at: datetime,
+) -> bool:
+    candidates = build_device_candidates(identifier)
+    if not candidates:
+        return False
+
+    device = db.query(Device).filter(Device.device_identifier.in_(candidates)).first()
+    if not device:
+        return False
+
+    association = db.query(VehicleDeviceAssociation).filter(
+        VehicleDeviceAssociation.device_id == device.id,
+        VehicleDeviceAssociation.active == True
+    ).first()
+    if not association:
+        return False
+
+    vehicle = db.query(Vehicle).filter(Vehicle.id == association.vehicle_id).first()
+    if not vehicle:
+        return False
+
+    location = Location(
+        device_id=device.id,
+        latitude=latitude,
+        longitude=longitude,
+        accuracy=accuracy,
+        movement_status=movement_status,
+        received_at=received_at,
+    )
+    db.add(location)
+
+    # Classify current vehicle zone by latest location against active polygons.
+    zone_name = find_zone_name_for_location(db, latitude, longitude)
+    if zone_name:
+        vehicle.zone = zone_name
+    else:
+        vehicle.zone = "Hors zone"
+
+    db.commit()
+    return True
+
+
+def process_mqtt_observation(message: dict) -> dict:
+    ble_scan = message.get("ble_scan") or {}
+    devices = ble_scan.get("devices") or []
+    fallback_ts = message.get("timestamp")
+
+    if not isinstance(devices, list):
+        return {"devices": 0, "saved": 0}
+
+    saved_count = 0
+    db = SessionLocal()
+    try:
+        for dev in devices:
+            if not isinstance(dev, dict):
+                continue
+
+            tag_id = dev.get("tag_id")
+            lat = dev.get("latitude")
+            lon = dev.get("longitude")
+            if not tag_id or lat is None or lon is None:
+                continue
+
+            movement_status = "moving" if dev.get("is_moving") else "static"
+            received_at = parse_received_at(dev.get("last_seen") or fallback_ts)
+            accuracy = dev.get("accuracy")
+
+            saved = save_location_for_identifier(
+                db=db,
+                identifier=tag_id,
+                latitude=lat,
+                longitude=lon,
+                accuracy=accuracy,
+                movement_status=movement_status,
+                received_at=received_at,
+            )
+            if saved:
+                saved_count += 1
+    finally:
+        db.close()
+
+    return {"devices": len(devices), "saved": saved_count}
+
+
+def on_mqtt_connect(client, userdata, flags, rc, *args):
+    now = utc_now_iso()
+    update_mqtt_debug_state(last_connect_rc=rc, last_connect_at=now)
+    if rc == 0:
+        logger.info("MQTT connected, subscribing to %s", mqtt_runtime_config["topic"])
+        update_mqtt_debug_state(connected=True, subscribed=False, subscribed_topic=None)
+        client.subscribe(mqtt_runtime_config["topic"])
+    else:
+        update_mqtt_debug_state(connected=False, subscribed=False)
+        logger.error("MQTT connection failed with rc=%s", rc)
+
+
+def on_mqtt_disconnect(client, userdata, rc, *args):
+    update_mqtt_debug_state(
+        connected=False,
+        subscribed=False,
+        last_disconnect_rc=rc,
+        last_disconnect_at=utc_now_iso(),
+    )
+    logger.warning("MQTT disconnected with rc=%s", rc)
+
+
+def on_mqtt_subscribe(client, userdata, mid, granted_qos, *args):
+    update_mqtt_debug_state(
+        subscribed=True,
+        subscribed_topic=mqtt_runtime_config["topic"],
+    )
+    logger.info("MQTT subscribed to %s with qos=%s", mqtt_runtime_config["topic"], granted_qos)
+
+
+def on_mqtt_message(client, userdata, msg):
+    now = utc_now_iso()
+    update_mqtt_debug_state(
+        last_message_at=now,
+        last_message_topic=msg.topic,
+        last_payload_size=len(msg.payload or b""),
+    )
+
+    snap = get_mqtt_debug_snapshot()
+    update_mqtt_debug_state(messages_received=snap["messages_received"] + 1)
+
+    try:
+        payload = json.loads(msg.payload.decode("utf-8"))
+    except Exception as exc:
+        snap = get_mqtt_debug_snapshot()
+        update_mqtt_debug_state(
+            decode_errors=snap["decode_errors"] + 1,
+            last_error=str(exc),
+            last_error_at=now,
+        )
+        logger.error("MQTT payload decode error: %s", exc)
+        return
+
+    if isinstance(payload, dict):
+        result = process_mqtt_observation(payload)
+        snap = get_mqtt_debug_snapshot()
+        update_mqtt_debug_state(
+            payloads_processed=snap["payloads_processed"] + 1,
+            locations_saved=snap["locations_saved"] + result["saved"],
+            last_payload_devices=result["devices"],
+            last_payload_saved=result["saved"],
+        )
+
+
+def start_mqtt_subscriber(config: dict):
+    global mqtt_client
+
+    set_runtime_mqtt_config(config)
+
+    if not mqtt_runtime_config["enabled"]:
+        logger.info("MQTT subscriber disabled (enabled=false)")
+        return
+
+    if not all([mqtt_runtime_config["host"], mqtt_runtime_config["username"], mqtt_runtime_config["password"], mqtt_runtime_config["topic"]]):
+        logger.warning("MQTT subscriber not started: missing MQTT config")
+        return
+
+    try:
+        mqtt_client = mqtt.Client(client_id=f"blekon-api-{os.getpid()}")
+        mqtt_client.username_pw_set(mqtt_runtime_config["username"], mqtt_runtime_config["password"])
+        mqtt_client.tls_set()
+        mqtt_client.on_connect = on_mqtt_connect
+        mqtt_client.on_disconnect = on_mqtt_disconnect
+        mqtt_client.on_subscribe = on_mqtt_subscribe
+        mqtt_client.on_message = on_mqtt_message
+        mqtt_client.connect(mqtt_runtime_config["host"], mqtt_runtime_config["port"], keepalive=60)
+        mqtt_client.loop_start()
+        update_mqtt_debug_state(client_started=True, last_error=None)
+        logger.info("MQTT subscriber started")
+    except Exception as exc:
+        update_mqtt_debug_state(
+            client_started=False,
+            connected=False,
+            subscribed=False,
+            last_error=str(exc),
+            last_error_at=utc_now_iso(),
+        )
+        logger.error("Failed to start MQTT subscriber: %s", exc)
+
+
+def stop_mqtt_subscriber():
+    global mqtt_client
+
+    if mqtt_client is None:
+        return
+
+    try:
+        mqtt_client.loop_stop()
+        mqtt_client.disconnect()
+        update_mqtt_debug_state(client_started=False, connected=False, subscribed=False)
+        logger.info("MQTT subscriber stopped")
+    except Exception as exc:
+        update_mqtt_debug_state(last_error=str(exc), last_error_at=utc_now_iso())
+        logger.error("Failed to stop MQTT subscriber: %s", exc)
+    finally:
+        mqtt_client = None
+
+
+def restart_mqtt_subscriber(config: dict):
+    stop_mqtt_subscriber()
+    start_mqtt_subscriber(config)
+
+
+@app.on_event("startup")
+def app_startup_mqtt_subscriber():
+    start_mqtt_subscriber(get_effective_mqtt_config())
+
+
+@app.on_event("shutdown")
+def app_shutdown_mqtt_subscriber():
+    stop_mqtt_subscriber()
+
 # -------------------
 # Webhook pour positions
 # -------------------
@@ -50,98 +475,222 @@ async def blekon_webhook(request: Request):
         if data and isinstance(data[0], dict) and "type" in data[0]:
             for event in data:
                 if event.get("type") == "network.device_position":
-                    raw_id = str(event["data"]["device_id"]).lower()
-                    base_id = raw_id.removeprefix("urn:uuid:")
-                    candidates = {raw_id, base_id}
-                    if len(base_id) == 32:  # also try dashed UUID form
-                        dashed = f"{base_id[0:8]}-{base_id[8:12]}-{base_id[12:16]}-{base_id[16:20]}-{base_id[20:32]}"
-                        candidates.add(dashed)
-
                     coords = event["data"]["geojson"]["geometry"]["coordinates"]  # [lon, lat]
-                    accuracy = event["data"]["quality"].get("accuracy_meters")
+                    accuracy = (event.get("data", {}).get("quality") or {}).get("accuracy_meters")
                     movement_status = event["data"].get("movement_status", "static")
-
-                    device = db.query(Device).filter(Device.device_identifier.in_(list(candidates))).first()
-                    if not device:
-                        continue
-
-                    association = db.query(VehicleDeviceAssociation).filter(
-                        VehicleDeviceAssociation.device_id == device.id,
-                        VehicleDeviceAssociation.active == True
-                    ).first()
-                    if not association:
-                        continue
-
-                    vehicle = db.query(Vehicle).filter(Vehicle.id == association.vehicle_id).first()
-                    if not vehicle:
-                        continue
-
-                    location = Location(
-                        device_id=device.id,
+                    save_location_for_identifier(
+                        db=db,
+                        identifier=event["data"].get("device_id", ""),
                         latitude=coords[1],
                         longitude=coords[0],
                         accuracy=accuracy,
                         movement_status=movement_status,
-                        received_at=datetime.utcnow()
+                        received_at=datetime.utcnow(),
                     )
-                    db.add(location)
-                    db.commit()
 
         # Case 2: vendor tag batch (fields: tag_id, vendor, last_lat, last_lon, is_moving, updated_at)
         elif data and isinstance(data[0], dict) and "tag_id" in data[0]:
             for tag in data:
-                raw_id = str(tag.get("tag_id", "")).lower()
-                if not raw_id:
-                    continue
-
-                base_id = raw_id.removeprefix("urn:uuid:")
-                candidates = {raw_id, base_id}
-                if len(base_id) == 32:
-                    dashed = f"{base_id[0:8]}-{base_id[8:12]}-{base_id[12:16]}-{base_id[16:20]}-{base_id[20:32]}"
-                    candidates.add(dashed)
-
                 lat = tag.get("last_lat")
                 lon = tag.get("last_lon")
+                movement_status = "moving" if tag.get("is_moving") else "static"
                 if lat is None or lon is None:
                     continue
 
-                movement_status = "moving" if tag.get("is_moving") else "static"
-
-                ts = tag.get("updated_at") or tag.get("last_seen")
-                received_at = datetime.utcnow()
-                if isinstance(ts, str):
-                    try:
-                        received_at = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                    except Exception:
-                        received_at = datetime.utcnow()
-
-                device = db.query(Device).filter(Device.device_identifier.in_(list(candidates))).first()
-                if not device:
-                    continue
-
-                association = db.query(VehicleDeviceAssociation).filter(
-                    VehicleDeviceAssociation.device_id == device.id,
-                    VehicleDeviceAssociation.active == True
-                ).first()
-                if not association:
-                    continue
-
-                vehicle = db.query(Vehicle).filter(Vehicle.id == association.vehicle_id).first()
-                if not vehicle:
-                    continue
-
-                location = Location(
-                    device_id=device.id,
+                save_location_for_identifier(
+                    db=db,
+                    identifier=tag.get("tag_id", ""),
                     latitude=lat,
                     longitude=lon,
                     accuracy=None,
                     movement_status=movement_status,
-                    received_at=received_at
+                    received_at=parse_received_at(tag.get("updated_at") or tag.get("last_seen")),
                 )
-                db.add(location)
-                db.commit()
 
     return {"status": "ok"}
+
+
+# -------------------
+# MQTT admin config (no auth, as requested)
+# -------------------
+@app.get("/admin/mqtt/config")
+def get_mqtt_config(db: Session = Depends(get_db)):
+    db_cfg = get_db_mqtt_config(db)
+    if db_cfg:
+        return {
+            "source": "database",
+            "enabled": db_cfg.enabled,
+            "host": db_cfg.host,
+            "port": db_cfg.port,
+            "username": db_cfg.username,
+            "topic": db_cfg.topic,
+            "is_active": db_cfg.is_active,
+        }
+
+    env_cfg = get_env_mqtt_config()
+    return {
+        "source": "environment",
+        "enabled": env_cfg["enabled"],
+        "host": env_cfg["host"],
+        "port": env_cfg["port"],
+        "username": env_cfg["username"],
+        "topic": env_cfg["topic"],
+        "is_active": True,
+    }
+
+
+@app.put("/admin/mqtt/config")
+def update_mqtt_config(payload: MqttConfigIn, db: Session = Depends(get_db)):
+    db.query(MqttBrokerConfig).filter(MqttBrokerConfig.is_active == True).update({"is_active": False})
+
+    new_cfg = MqttBrokerConfig(
+        host=payload.host,
+        port=payload.port,
+        username=payload.username,
+        password=payload.password,
+        topic=payload.topic,
+        enabled=payload.enabled,
+        is_active=True,
+    )
+    db.add(new_cfg)
+    db.commit()
+
+    restart_mqtt_subscriber(
+        {
+            "enabled": payload.enabled,
+            "host": payload.host,
+            "port": payload.port,
+            "username": payload.username,
+            "password": payload.password,
+            "topic": payload.topic,
+        }
+    )
+
+    return {
+        "message": "MQTT config updated and subscriber restarted",
+        "enabled": payload.enabled,
+        "host": payload.host,
+        "port": payload.port,
+        "username": payload.username,
+        "topic": payload.topic,
+    }
+
+
+# -------------------
+# Zones APIs (frontend draws min 3 points on map)
+# -------------------
+@app.post("/zones", response_model=ZoneOut)
+def create_zone(payload: ZoneCreate, db: Session = Depends(get_db)):
+    existing = db.query(Zone).filter(Zone.name == payload.name).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Zone name already exists")
+
+    zone = Zone(
+        name=payload.name,
+        points_json=json.dumps([{"lat": p.lat, "lon": p.lon} for p in payload.points]),
+        active=True,
+    )
+    db.add(zone)
+    db.commit()
+    db.refresh(zone)
+
+    return ZoneOut(
+        id=zone.id,
+        name=zone.name,
+        points=parse_zone_points(zone.points_json),
+        active=zone.active,
+        created_at=zone.created_at,
+        updated_at=zone.updated_at,
+    )
+
+
+@app.get("/zones", response_model=list[ZoneOut])
+def list_zones(active_only: bool = Query(True), db: Session = Depends(get_db)):
+    query = db.query(Zone)
+    if active_only:
+        query = query.filter(Zone.active == True)
+
+    zones = query.order_by(Zone.id.asc()).all()
+    return [
+        ZoneOut(
+            id=z.id,
+            name=z.name,
+            points=parse_zone_points(z.points_json),
+            active=z.active,
+            created_at=z.created_at,
+            updated_at=z.updated_at,
+        )
+        for z in zones
+    ]
+
+
+@app.put("/zones/{zone_id}", response_model=ZoneOut)
+def update_zone(zone_id: int, payload: ZoneUpdate, db: Session = Depends(get_db)):
+    zone = db.query(Zone).filter(Zone.id == zone_id).first()
+    if not zone:
+        raise HTTPException(status_code=404, detail="Zone not found")
+
+    if payload.name is not None:
+        conflict = db.query(Zone).filter(Zone.name == payload.name, Zone.id != zone_id).first()
+        if conflict:
+            raise HTTPException(status_code=400, detail="Zone name already exists")
+        zone.name = payload.name
+
+    if payload.points is not None:
+        zone.points_json = json.dumps([{"lat": p.lat, "lon": p.lon} for p in payload.points])
+
+    if payload.active is not None:
+        zone.active = payload.active
+
+    zone.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(zone)
+
+    return ZoneOut(
+        id=zone.id,
+        name=zone.name,
+        points=parse_zone_points(zone.points_json),
+        active=zone.active,
+        created_at=zone.created_at,
+        updated_at=zone.updated_at,
+    )
+
+
+@app.delete("/zones/{zone_id}")
+def delete_zone(zone_id: int, db: Session = Depends(get_db)):
+    zone = db.query(Zone).filter(Zone.id == zone_id).first()
+    if not zone:
+        raise HTTPException(status_code=404, detail="Zone not found")
+
+    deleted_zone_name = zone.name
+
+    # Reset vehicles currently assigned to this zone name.
+    db.query(Vehicle).filter(Vehicle.zone == deleted_zone_name).update(
+        {"zone": "Hors zone"},
+        synchronize_session=False
+    )
+
+    db.delete(zone)
+    db.commit()
+    return {
+        "message": "Zone deleted successfully",
+        "zone_id": zone_id,
+        "cleared_zone_name": deleted_zone_name,
+        "vehicles_updated_to": "Hors zone"
+    }
+
+
+@app.get("/vehicles/{vehicle_id}/zone")
+def get_vehicle_zone(vehicle_id: int, db: Session = Depends(get_db)):
+    vehicle = db.query(Vehicle).filter(Vehicle.id == vehicle_id).first()
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+
+    return {
+        "vehicle_id": vehicle.id,
+        "zone": vehicle.zone,
+        "message": "Current zone based on last processed location"
+    }
 
 # -------------------
 # Gestion des voitures
@@ -242,6 +791,19 @@ def get_associated_vehicles(include_positions: bool = Query(True), db: Session =
 
     return results
 
+
+@app.get("/admin/mqtt/debug")
+def get_mqtt_debug():
+    state = get_mqtt_debug_snapshot()
+    state["runtime_config"] = {
+        "enabled": mqtt_runtime_config["enabled"],
+        "host": mqtt_runtime_config["host"],
+        "port": mqtt_runtime_config["port"],
+        "username": mqtt_runtime_config["username"],
+        "topic": mqtt_runtime_config["topic"],
+    }
+    return state
+
 @app.get("/cars/{car_id}", response_model=VehicleOut)
 def get_car(car_id: int, db: Session = Depends(get_db)):
     car = db.query(Vehicle).filter(Vehicle.id == car_id).first()
@@ -280,13 +842,13 @@ def delete_car(car_id: int, db: Session = Depends(get_db)):
 def associate_vehicle_device(vehicle_id: int, device_identifier: str, db: Session = Depends(get_db)):
     raw_device_id = device_identifier.lower()
     base_id = raw_device_id.removeprefix("urn:uuid:")
-    candidates = {raw_device_id, base_id}
-    if len(base_id) == 32:
-        dashed = f"{base_id[0:8]}-{base_id[8:12]}-{base_id[12:16]}-{base_id[16:20]}-{base_id[20:32]}"
-        candidates.add(dashed)
+    no_dash_id = base_id.replace("-", "")
+    candidates = set(build_device_candidates(device_identifier))
+    if len(no_dash_id) == 32:
+        dashed = f"{no_dash_id[0:8]}-{no_dash_id[8:12]}-{no_dash_id[12:16]}-{no_dash_id[16:20]}-{no_dash_id[20:32]}"
         canonical = dashed  # store dashed form without prefix
     else:
-        canonical = base_id  # store prefixless form
+        canonical = base_id  # fallback as-is without prefix
 
     # 1️⃣ Vérifier si la voiture existe
     vehicle = db.query(Vehicle).filter(Vehicle.id == vehicle_id).first()
@@ -301,21 +863,46 @@ def associate_vehicle_device(vehicle_id: int, device_identifier: str, db: Sessio
         db.commit()
         db.refresh(device)
 
-    # 3️⃣ Désactiver les anciennes associations pour ce device
+    # Si déjà associé activement à ce même véhicule, rien à changer.
+    existing_same = db.query(VehicleDeviceAssociation).filter(
+        VehicleDeviceAssociation.vehicle_id == vehicle.id,
+        VehicleDeviceAssociation.device_id == device.id,
+        VehicleDeviceAssociation.active == True
+    ).first()
+    if existing_same:
+        return {
+            "vehicle_id": vehicle.id,
+            "device_id": device.device_identifier,
+            "association_active": True,
+            "message": "Association déjà active"
+        }
+
+    now = datetime.utcnow()
+
+    # 3️⃣ Désactiver l'ancienne association active de CE véhicule (si existe)
+    db.query(VehicleDeviceAssociation).filter(
+        VehicleDeviceAssociation.vehicle_id == vehicle.id,
+        VehicleDeviceAssociation.active == True
+    ).update({
+        "active": False,
+        "disassociation_date": now
+    })
+
+    # 4️⃣ Désactiver les anciennes associations pour ce device
     db.query(VehicleDeviceAssociation).filter(
         VehicleDeviceAssociation.device_id == device.id,
         VehicleDeviceAssociation.active == True
     ).update({
         "active": False,
-        "disassociation_date": datetime.utcnow()
+        "disassociation_date": now
     })
 
-    # 4️⃣ Créer la nouvelle association
+    # 5️⃣ Créer la nouvelle association
     new_association = VehicleDeviceAssociation(
         vehicle_id=vehicle.id,
         device_id=device.id,
         active=True,
-        association_date=datetime.utcnow()
+        association_date=now
     )
     db.add(new_association)
     db.commit()
@@ -325,6 +912,47 @@ def associate_vehicle_device(vehicle_id: int, device_identifier: str, db: Sessio
         "device_id": device.device_identifier,
         "association_active": True,
         "message": "Association créée avec succès"
+    }
+
+
+@app.delete("/associate")
+def delete_vehicle_device_association(
+    vehicle_id: int,
+    device_identifier: Optional[str] = Query(None),
+    only_active: bool = Query(True),
+    db: Session = Depends(get_db),
+):
+    vehicle = db.query(Vehicle).filter(Vehicle.id == vehicle_id).first()
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+
+    query = db.query(VehicleDeviceAssociation).filter(
+        VehicleDeviceAssociation.vehicle_id == vehicle_id
+    )
+
+    if only_active:
+        query = query.filter(VehicleDeviceAssociation.active == True)
+
+    if device_identifier:
+        candidates = build_device_candidates(device_identifier)
+        device_ids = [row[0] for row in db.query(Device.id).filter(Device.device_identifier.in_(candidates)).all()]
+        if not device_ids:
+            raise HTTPException(status_code=404, detail="Device not found for provided identifier")
+        query = query.filter(VehicleDeviceAssociation.device_id.in_(device_ids))
+
+    associations = query.all()
+    if not associations:
+        raise HTTPException(status_code=404, detail="No matching association found")
+
+    deleted_count = len(associations)
+    for association in associations:
+        db.delete(association)
+
+    db.commit()
+    return {
+        "vehicle_id": vehicle_id,
+        "deleted_associations": deleted_count,
+        "message": "Association(s) deleted from database",
     }
 
 # -------------------
@@ -339,7 +967,7 @@ def get_vehicle_device(vehicle_id: int, db: Session = Depends(get_db)):
     association = db.query(VehicleDeviceAssociation).filter(
         VehicleDeviceAssociation.vehicle_id == vehicle_id,
         VehicleDeviceAssociation.active == True
-    ).first()
+    ).order_by(desc(VehicleDeviceAssociation.association_date)).first()
     
     if not association:
         return {"vehicle_id": vehicle_id, "device_id": None, "message": "Aucun device associé"}
@@ -367,7 +995,7 @@ def get_latest_positions(car_id: int = Query(None), db: Session = Depends(get_db
         association = db.query(VehicleDeviceAssociation).filter(
             VehicleDeviceAssociation.vehicle_id == car_id,
             VehicleDeviceAssociation.active == True
-        ).first()
+        ).order_by(desc(VehicleDeviceAssociation.association_date)).first()
         
         if not association:
             return []  # Pas de device associé

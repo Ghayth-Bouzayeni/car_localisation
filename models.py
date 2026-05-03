@@ -95,3 +95,36 @@ class Alert(Base):
     created_at = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))
 
     vehicle = relationship("Vehicle", back_populates="alerts")
+
+
+# -------------------
+# ZONES (POLYGONS DRAWN BY FRONTEND)
+# -------------------
+class Zone(Base):
+    __tablename__ = "zones"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), unique=True, nullable=False)
+    # Stored as JSON string: [{"lat": ..., "lon": ...}, ...]
+    points_json = Column(String, nullable=False)
+    active = Column(Boolean, default=True)
+    created_at = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))
+    updated_at = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))
+
+
+# -------------------
+# MQTT BROKER CONFIGS
+# -------------------
+class MqttBrokerConfig(Base):
+    __tablename__ = "mqtt_broker_configs"
+
+    id = Column(Integer, primary_key=True)
+    host = Column(String(255), nullable=False)
+    port = Column(Integer, nullable=False, default=8883)
+    username = Column(String(255), nullable=False)
+    password = Column(String(255), nullable=False)
+    topic = Column(String(255), nullable=False, default="parking/+/+/observations")
+    enabled = Column(Boolean, default=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))
+    updated_at = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))

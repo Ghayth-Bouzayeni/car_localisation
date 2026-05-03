@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import Optional
 from datetime import date, datetime
 
@@ -154,3 +154,46 @@ class VehicleFrontOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# =========================
+# ZONES
+# =========================
+
+class ZonePoint(BaseModel):
+    lat: float
+    lon: float
+
+
+class ZoneCreate(BaseModel):
+    name: str
+    points: list[ZonePoint]
+
+    @field_validator("points")
+    @classmethod
+    def validate_points(cls, value: list[ZonePoint]):
+        if len(value) < 3:
+            raise ValueError("Zone must contain at least 3 points")
+        return value
+
+
+class ZoneUpdate(BaseModel):
+    name: Optional[str] = None
+    points: Optional[list[ZonePoint]] = None
+    active: Optional[bool] = None
+
+    @field_validator("points")
+    @classmethod
+    def validate_points(cls, value: Optional[list[ZonePoint]]):
+        if value is not None and len(value) < 3:
+            raise ValueError("Zone must contain at least 3 points")
+        return value
+
+
+class ZoneOut(BaseModel):
+    id: int
+    name: str
+    points: list[ZonePoint]
+    active: bool
+    created_at: datetime
+    updated_at: datetime
