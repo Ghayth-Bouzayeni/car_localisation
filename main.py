@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends, Request, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import desc, func
+from sqlalchemy import desc, func, and_, or_
 from models import Base, Vehicle, Location, Device, VehicleDeviceAssociation, MqttBrokerConfig, Zone
 from database import SessionLocal, engine
 from schemas import VehicleCreate, VehicleUpdate, VehicleOut, LocationOut, VehicleFrontOut, ZoneCreate, ZoneUpdate, ZoneOut
@@ -27,6 +27,11 @@ logger = logging.getLogger("blekon_api")
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
+
+@app.head("/health")
+def health_check_head():
+    return {}
 
 MQTT_ENABLED = os.getenv("MQTT_ENABLED", "true").lower() == "true"
 MQTT_HOST = os.getenv("MQTT_HOST", "")
@@ -1040,20 +1045,27 @@ def get_positions_history(
     associations = db.query(VehicleDeviceAssociation).filter(
         VehicleDeviceAssociation.vehicle_id == car_id
     ).all()
-    
-    device_ids = [assoc.device_id for assoc in associations]
-    
-    if not device_ids:
+
+    if not associations:
         return []  # Aucun device associé
-    
-    # Construire la requête pour les positions
-    query = db.query(Location).filter(Location.device_id.in_(device_ids))
-    
+
+    # Build time-window filters per association to avoid mixing locations from other cars.
+    window_filters = []
+    for assoc in associations:
+        end_time = assoc.disassociation_date or datetime.utcnow()
+        window_filters.append(and_(
+            Location.device_id == assoc.device_id,
+            Location.received_at >= assoc.association_date,
+            Location.received_at <= end_time,
+        ))
+
+    query = db.query(Location).filter(or_(*window_filters))
+
     if start_date:
         query = query.filter(Location.received_at >= start_date)
     if end_date:
         query = query.filter(Location.received_at <= end_date)
-    
+
     return query.order_by(desc(Location.received_at)).all()
 
 # -------------------
