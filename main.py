@@ -1001,15 +1001,33 @@ def get_latest_positions(car_id: int = Query(None), db: Session = Depends(get_db
             VehicleDeviceAssociation.vehicle_id == car_id,
             VehicleDeviceAssociation.active == True
         ).order_by(desc(VehicleDeviceAssociation.association_date)).first()
-        
-        if not association:
-            return []  # Pas de device associé
-        
-        # Récupérer la dernière position du device
+
+        if association:
+            # Récupérer la dernière position du device
+            location = db.query(Location).filter(
+                Location.device_id == association.device_id
+            ).order_by(desc(Location.received_at)).first()
+
+            return [location] if location else []
+
+        # No active association: return last position before disassociation.
+        last_assoc = db.query(VehicleDeviceAssociation).filter(
+            VehicleDeviceAssociation.vehicle_id == car_id
+        ).order_by(desc(func.coalesce(
+            VehicleDeviceAssociation.disassociation_date,
+            VehicleDeviceAssociation.association_date,
+        ))).first()
+
+        if not last_assoc:
+            return []
+
+        end_time = last_assoc.disassociation_date or last_assoc.association_date
         location = db.query(Location).filter(
-            Location.device_id == association.device_id
+            Location.device_id == last_assoc.device_id,
+            Location.received_at >= last_assoc.association_date,
+            Location.received_at <= end_time,
         ).order_by(desc(Location.received_at)).first()
-        
+
         return [location] if location else []
     
     else:
