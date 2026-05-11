@@ -10,10 +10,10 @@ class VehicleCreate(BaseModel):
     # ⚠️ ATTENTION: device_id est retiré car il n'existe pas dans la table vehicles
     # L'association se fait via l'endpoint /associate et la table vehicle_device_associations
     vin: str
-    model: str
-    color: str
-    zone: str
-    entry_date: date
+    model: Optional[str] = None
+    color: Optional[str] = None
+    zone: Optional[str] = None
+    entry_date: Optional[date] = None
     delivery_date: Optional[date] = None  # Rendre optionnel
     customer: Optional[str] = None
     delivery_country: Optional[str] = None
@@ -41,11 +41,11 @@ class VehicleOut(BaseModel):
     id: int
     # ⚠️ device_id retiré - il n'existe pas dans la table vehicles
     vin: str
-    model: str
-    color: str
-    zone: str
+    model: Optional[str] = None
+    color: Optional[str] = None
+    zone: Optional[str] = None
     status: str
-    entry_date: date
+    entry_date: Optional[date] = None
     delivery_date: Optional[date] = None
     customer: Optional[str] = None
     delivery_country: Optional[str] = None
@@ -142,9 +142,9 @@ class VehicleFrontOut(BaseModel):
     """Format spécifique pour le frontend si besoin"""
     id: int
     vin: str
-    model: str
-    color: str
-    zone: str
+    model: Optional[str] = None
+    color: Optional[str] = None
+    zone: Optional[str] = None
     status: str
     device_identifier: Optional[str] = None  # 🔹 Ceci vient de l'association, pas de la table vehicles
     association_date: Optional[datetime] = None  # 🔹 Date d'association

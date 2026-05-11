@@ -702,7 +702,7 @@ def get_vehicle_zone(vehicle_id: int, db: Session = Depends(get_db)):
 # -------------------
 @app.post("/cars", response_model=VehicleOut)
 def create_car(car: VehicleCreate, db: Session = Depends(get_db)):
-    db_car = Vehicle(**car.dict())
+    db_car = Vehicle(**car.dict(exclude_unset=True))
     db.add(db_car)
     db.commit()
     db.refresh(db_car)
