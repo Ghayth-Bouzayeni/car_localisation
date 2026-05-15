@@ -717,23 +717,47 @@ def get_cars(db: Session = Depends(get_db)):
 # -------------------
 @app.get("/cars/with-positions", response_model=list[VehicleFrontOut])
 def get_cars_with_positions(db: Session = Depends(get_db)):
-    # Get all active associations with their vehicle and device
-    associations = db.query(VehicleDeviceAssociation).filter(
+    # Pull active associations and latest locations in a single query.
+    subquery = db.query(
+        Location.device_id,
+        func.max(Location.received_at).label("last_received"),
+    ).group_by(Location.device_id).subquery()
+
+    latest_locations = db.query(
+        Location.device_id.label("device_id"),
+        Location.latitude.label("latitude"),
+        Location.longitude.label("longitude"),
+        Location.received_at.label("received_at"),
+    ).join(
+        subquery,
+        and_(
+            Location.device_id == subquery.c.device_id,
+            Location.received_at == subquery.c.last_received,
+        )
+    ).subquery()
+
+    query = db.query(
+        Vehicle,
+        Device,
+        VehicleDeviceAssociation,
+        latest_locations.c.latitude,
+        latest_locations.c.longitude,
+        latest_locations.c.received_at,
+    ).join(
+        VehicleDeviceAssociation,
+        VehicleDeviceAssociation.vehicle_id == Vehicle.id,
+    ).join(
+        Device,
+        Device.id == VehicleDeviceAssociation.device_id,
+    ).outerjoin(
+        latest_locations,
+        latest_locations.c.device_id == Device.id,
+    ).filter(
         VehicleDeviceAssociation.active == True
-    ).all()
+    )
 
     results = []
-    for assoc in associations:
-        vehicle = db.query(Vehicle).filter(Vehicle.id == assoc.vehicle_id).first()
-        device = db.query(Device).filter(Device.id == assoc.device_id).first()
-        if not vehicle or not device:
-            continue
-
-        # Get latest position for this device
-        location = db.query(Location).filter(
-            Location.device_id == device.id
-        ).order_by(desc(Location.received_at)).first()
-
+    for vehicle, device, assoc, latitude, longitude, received_at in query.all():
         results.append(VehicleFrontOut(
             id=vehicle.id,
             vin=vehicle.vin,
@@ -743,9 +767,9 @@ def get_cars_with_positions(db: Session = Depends(get_db)):
             status=vehicle.status,
             device_identifier=device.device_identifier,
             association_date=assoc.association_date,
-            last_latitude=float(location.latitude) if location else None,
-            last_longitude=float(location.longitude) if location else None,
-            last_position_time=location.received_at if location else None,
+            last_latitude=float(latitude) if latitude is not None else None,
+            last_longitude=float(longitude) if longitude is not None else None,
+            last_position_time=received_at,
         ))
 
     return results
@@ -1052,6 +1076,7 @@ def get_positions_history(
     car_id: int = Query(...),  # Requis pour l'historique
     start_date: datetime = Query(None),
     end_date: datetime = Query(None),
+    limit: int = Query(200),
     db: Session = Depends(get_db)
 ):
     # Vérifier si le véhicule existe
@@ -1084,7 +1109,7 @@ def get_positions_history(
     if end_date:
         query = query.filter(Location.received_at <= end_date)
 
-    return query.order_by(desc(Location.received_at)).all()
+    return query.order_by(desc(Location.received_at)).limit(limit).all()
 
 # -------------------
 # Lancer le serveur
