@@ -158,26 +158,49 @@ def get_mqtt_debug_snapshot() -> dict:
         return dict(mqtt_debug_state)
 
 
+def strip_identifier_prefix(identifier: str) -> str:
+    raw = str(identifier or "").strip()
+    if not raw:
+        return ""
+
+    lowered = raw.lower()
+    if lowered.startswith("urn:uuid:"):
+        return raw[len("urn:uuid:"):]
+
+    if lowered.startswith("http://") or lowered.startswith("https://"):
+        slash_index = raw.rfind("/")
+        return raw[slash_index + 1:] if slash_index >= 0 else raw
+
+    return raw
+
+
 def build_device_candidates(identifier: str) -> list[str]:
-    raw_id = str(identifier or "").strip().lower()
+    raw_id = str(identifier or "").strip()
     if not raw_id:
         return []
 
-    base_id = raw_id.removeprefix("urn:uuid:")
-    no_dash_id = base_id.replace("-", "")
-    candidates = {raw_id, base_id, no_dash_id}
-
-    # Include prefixed variants to support historical values in DB.
+    base_id = strip_identifier_prefix(raw_id)
+    base_variants = {raw_id, base_id}
+    base_variants.add(raw_id.lower())
+    base_variants.add(raw_id.upper())
     if base_id:
-        candidates.add(f"urn:uuid:{base_id}")
-    if no_dash_id:
-        candidates.add(f"urn:uuid:{no_dash_id}")
+        base_variants.add(base_id.lower())
+        base_variants.add(base_id.upper())
 
-    # Always try dashed UUID representation when we have 32 hex chars.
-    if len(no_dash_id) == 32:
-        dashed = f"{no_dash_id[0:8]}-{no_dash_id[8:12]}-{no_dash_id[12:16]}-{no_dash_id[16:20]}-{no_dash_id[20:32]}"
-        candidates.add(dashed)
-        candidates.add(f"urn:uuid:{dashed}")
+    candidates = set()
+    for variant in base_variants:
+        if not variant:
+            continue
+        candidates.add(variant)
+        no_dash = variant.replace("-", "")
+        candidates.add(no_dash)
+        candidates.add(f"urn:uuid:{variant}")
+        candidates.add(f"urn:uuid:{no_dash}")
+
+        if len(no_dash) == 32:
+            dashed = f"{no_dash[0:8]}-{no_dash[8:12]}-{no_dash[12:16]}-{no_dash[16:20]}-{no_dash[20:32]}"
+            candidates.add(dashed)
+            candidates.add(f"urn:uuid:{dashed}")
 
     return [item for item in candidates if item]
 
@@ -869,15 +892,8 @@ def delete_car(car_id: int, db: Session = Depends(get_db)):
 # -------------------
 @app.post("/associate")
 def associate_vehicle_device(vehicle_id: int, device_identifier: str, db: Session = Depends(get_db)):
-    raw_device_id = device_identifier.lower()
-    base_id = raw_device_id.removeprefix("urn:uuid:")
-    no_dash_id = base_id.replace("-", "")
     candidates = set(build_device_candidates(device_identifier))
-    if len(no_dash_id) == 32:
-        dashed = f"{no_dash_id[0:8]}-{no_dash_id[8:12]}-{no_dash_id[12:16]}-{no_dash_id[16:20]}-{no_dash_id[20:32]}"
-        canonical = dashed  # store dashed form without prefix
-    else:
-        canonical = base_id  # fallback as-is without prefix
+    canonical = strip_identifier_prefix(device_identifier)
 
     # 1️⃣ Vérifier si la voiture existe
     vehicle = db.query(Vehicle).filter(Vehicle.id == vehicle_id).first()
